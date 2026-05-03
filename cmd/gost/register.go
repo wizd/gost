@@ -6,6 +6,7 @@ import (
 	_ "github.com/go-gost/x/connector/forward"
 	_ "github.com/go-gost/x/connector/http"
 	_ "github.com/go-gost/x/connector/http2"
+	_ "github.com/go-gost/x/connector/masque"
 	_ "github.com/go-gost/x/connector/relay"
 	_ "github.com/go-gost/x/connector/router"
 	_ "github.com/go-gost/x/connector/serial"
@@ -18,9 +19,10 @@ import (
 	_ "github.com/go-gost/x/connector/tcp"
 	_ "github.com/go-gost/x/connector/tunnel"
 	_ "github.com/go-gost/x/connector/unix"
-	_ "github.com/go-gost/x/connector/masque"
 
 	// Register dialers
+	_ "github.com/go-gost/gost/dialer/bp"
+	_ "github.com/go-gost/gost/dialer/bptls"
 	_ "github.com/go-gost/x/dialer/direct"
 	_ "github.com/go-gost/x/dialer/dtls"
 	_ "github.com/go-gost/x/dialer/ftcp"
@@ -78,6 +80,8 @@ import (
 	_ "github.com/go-gost/x/handler/unix"
 
 	// Register listeners
+	_ "github.com/go-gost/gost/listener/bp"
+	_ "github.com/go-gost/gost/listener/bptls"
 	_ "github.com/go-gost/x/listener/dns"
 	_ "github.com/go-gost/x/listener/dtls"
 	_ "github.com/go-gost/x/listener/ftcp"

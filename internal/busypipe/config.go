@@ -1,0 +1,128 @@
+package busypipe
+
+import (
+	"errors"
+
+	md "github.com/go-gost/core/metadata"
+	mdutil "github.com/go-gost/x/metadata/util"
+)
+
+const (
+	Magic            uint16 = 0x4250
+	Version          uint8  = 1
+	HeaderLen               = 16
+	MixedMetadataLen        = 8
+
+	DefaultMinBPS        = 8000
+	DefaultTickMS        = 250
+	DefaultMaxFrameSize  = 1400
+	DefaultIdleTimeoutMS = 15000
+	DefaultMinJitter     = 8
+)
+
+type Config struct {
+	Version       uint8
+	MinBPS        int
+	TickMS        int
+	MaxFrameSize  int
+	IdleTimeoutMS int
+	MinJitter     int
+}
+
+func DefaultConfig() Config {
+	return Config{
+		Version:       Version,
+		MinBPS:        DefaultMinBPS,
+		TickMS:        DefaultTickMS,
+		MaxFrameSize:  DefaultMaxFrameSize,
+		IdleTimeoutMS: DefaultIdleTimeoutMS,
+		MinJitter:     DefaultMinJitter,
+	}
+}
+
+func ConfigFromMetadata(m md.Metadata) Config {
+	cfg := DefaultConfig()
+	cfg.MinBPS = firstPositiveInt(
+		mdutil.GetInt(m, "bp.minBps"),
+		mdutil.GetInt(m, "bp.min_bps"),
+		mdutil.GetInt(m, "minBps"),
+		mdutil.GetInt(m, "min_bps"),
+		cfg.MinBPS,
+	)
+	cfg.TickMS = firstPositiveInt(
+		mdutil.GetInt(m, "bp.tickMs"),
+		mdutil.GetInt(m, "bp.tick_ms"),
+		mdutil.GetInt(m, "tickMs"),
+		mdutil.GetInt(m, "tick_ms"),
+		cfg.TickMS,
+	)
+	cfg.MaxFrameSize = firstPositiveInt(
+		mdutil.GetInt(m, "bp.maxFrameSize"),
+		mdutil.GetInt(m, "bp.max_frame_size"),
+		mdutil.GetInt(m, "maxFrameSize"),
+		mdutil.GetInt(m, "max_frame_size"),
+		cfg.MaxFrameSize,
+	)
+	cfg.IdleTimeoutMS = firstPositiveInt(
+		mdutil.GetInt(m, "bp.idleTimeoutMs"),
+		mdutil.GetInt(m, "bp.idle_timeout_ms"),
+		mdutil.GetInt(m, "idleTimeoutMs"),
+		mdutil.GetInt(m, "idle_timeout_ms"),
+		cfg.IdleTimeoutMS,
+	)
+	cfg.MinJitter = firstPositiveInt(
+		mdutil.GetInt(m, "bp.minJitterBytes"),
+		mdutil.GetInt(m, "bp.min_jitter_bytes"),
+		mdutil.GetInt(m, "minJitterBytes"),
+		mdutil.GetInt(m, "min_jitter_bytes"),
+		cfg.MinJitter,
+	)
+	if cfg.MaxFrameSize < HeaderLen+1 {
+		cfg.MaxFrameSize = HeaderLen + 1
+	}
+	if cfg.MinJitter < 0 {
+		cfg.MinJitter = 0
+	}
+	return cfg
+}
+
+func (c Config) Negotiate(peer Config) (Config, error) {
+	if c.Version != peer.Version {
+		return Config{}, errors.New("busypipe: incompatible protocol version")
+	}
+	out := Config{
+		Version:       c.Version,
+		MinBPS:        maxInt(c.MinBPS, peer.MinBPS),
+		TickMS:        maxInt(c.TickMS, peer.TickMS),
+		MaxFrameSize:  minInt(c.MaxFrameSize, peer.MaxFrameSize),
+		IdleTimeoutMS: minInt(c.IdleTimeoutMS, peer.IdleTimeoutMS),
+		MinJitter:     maxInt(c.MinJitter, peer.MinJitter),
+	}
+	if out.MaxFrameSize < HeaderLen+1 {
+		out.MaxFrameSize = HeaderLen + 1
+	}
+	return out, nil
+}
+
+func firstPositiveInt(values ...int) int {
+	for _, v := range values {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
