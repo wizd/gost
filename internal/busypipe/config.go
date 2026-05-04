@@ -9,7 +9,7 @@ import (
 
 const (
 	Magic            uint16 = 0x4250
-	Version          uint8  = 1
+	Version          uint8  = 2
 	HeaderLen               = 16
 	MixedMetadataLen        = 8
 

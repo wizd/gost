@@ -166,39 +166,61 @@ func (c *Conn) Write(p []byte) (int, error) {
 	}
 
 	written := 0
-	maxMixedData := c.codec.MaxPayloadSize() - MixedMetadataLen - c.cfg.MinJitter
-	if maxMixedData < 1 {
-		maxMixedData = 1
-	}
 
 	for len(p) > 0 {
-		chunkLen := maxMixedData
-		if chunkLen > len(p) {
-			chunkLen = len(p)
-		}
-		chunk := p[:chunkLen]
-		p = p[chunkLen:]
+		if c.scheduler.Deficit() > 0 {
+			chunkLen := c.maxMixedData()
+			if chunkLen > len(p) {
+				chunkLen = len(p)
+			}
+			chunk := p[:chunkLen]
+			p = p[chunkLen:]
 
-		targetPayloadLen := maxInt(
-			MixedMetadataLen+len(chunk)+c.cfg.MinJitter,
-			64,
-		)
-		if targetPayloadLen > c.codec.MaxPayloadSize() {
-			targetPayloadLen = c.codec.MaxPayloadSize()
-		}
-		payload, err := c.mixed.Build(chunk, targetPayloadLen)
-		if err != nil {
+			deficit := c.scheduler.Deficit()
+			deficitPayload := deficit - HeaderLen
+			if deficitPayload < 0 {
+				deficitPayload = 0
+			}
+			minPayload := MixedMetadataLen + len(chunk) + c.cfg.MinJitter
+			targetPayloadLen := maxInt(minPayload, deficitPayload)
+			if targetPayloadLen > c.codec.MaxPayloadSize() {
+				targetPayloadLen = c.codec.MaxPayloadSize()
+			}
+
+			payload, err := c.mixed.Build(chunk, targetPayloadLen)
+			if err != nil {
+				if err := c.writeFrame(FrameDATA, chunk, true); err != nil {
+					return written, err
+				}
+			} else {
+				if err := c.writeFrame(FrameMIXED, payload, true); err != nil {
+					return written, err
+				}
+			}
+			written += chunkLen
+		} else {
+			chunkLen := c.codec.MaxPayloadSize()
+			if chunkLen > len(p) {
+				chunkLen = len(p)
+			}
+			chunk := p[:chunkLen]
+			p = p[chunkLen:]
+
 			if err := c.writeFrame(FrameDATA, chunk, true); err != nil {
 				return written, err
 			}
-		} else {
-			if err := c.writeFrame(FrameMIXED, payload, true); err != nil {
-				return written, err
-			}
+			written += chunkLen
 		}
-		written += chunkLen
 	}
 	return written, nil
+}
+
+func (c *Conn) maxMixedData() int {
+	v := c.codec.MaxPayloadSize() - MixedMetadataLen - c.cfg.MinJitter
+	if v < 1 {
+		return 1
+	}
+	return v
 }
 
 func (c *Conn) Close() error {

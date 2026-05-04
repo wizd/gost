@@ -48,6 +48,21 @@ func TestSchedulerTarget(t *testing.T) {
 	}
 }
 
+func TestSchedulerDeficit(t *testing.T) {
+	s := NewMinRateScheduler(8000, 250)
+	if got := s.Deficit(); got != 250 {
+		t.Fatalf("initial deficit mismatch: got=%d want=250", got)
+	}
+	s.RecordSent(100)
+	if got := s.Deficit(); got != 150 {
+		t.Fatalf("deficit after 100 bytes mismatch: got=%d want=150", got)
+	}
+	s.RecordSent(200)
+	if got := s.Deficit(); got != 0 {
+		t.Fatalf("deficit should floor at zero: got=%d", got)
+	}
+}
+
 func TestConnSendReceive(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -108,5 +123,73 @@ func TestConnSendReceive(t *testing.T) {
 	}
 	if string(buf) != "ping" {
 		t.Fatalf("unexpected data: %q", string(buf))
+	}
+}
+
+func TestConnHighRateDirectData(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	cfg := DefaultConfig()
+	cfg.TickMS = 250
+	cfg.IdleTimeoutMS = 5000
+
+	serverErr := make(chan error, 1)
+	serverReady := make(chan *Conn, 1)
+	go func() {
+		raw, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		c, err := ServerConn(raw, cfg)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverReady <- c
+	}()
+
+	clientRaw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientRaw.Close()
+
+	clientConn, err := ClientConn(clientRaw, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+
+	var serverConn *Conn
+	select {
+	case err := <-serverErr:
+		t.Fatal(err)
+	case serverConn = <-serverReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server conn handshake timeout")
+	}
+	defer serverConn.Close()
+
+	payload := bytes.Repeat([]byte("a"), 1500)
+	_ = clientConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := clientConn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := clientConn.scheduler.Deficit(); got != 0 {
+		t.Fatalf("deficit should be zero after high-rate write, got=%d", got)
+	}
+
+	_ = serverConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(serverConn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, payload) {
+		t.Fatalf("unexpected payload length/content: got=%d want=%d", len(buf), len(payload))
 	}
 }

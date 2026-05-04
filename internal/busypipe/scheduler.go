@@ -33,11 +33,16 @@ func (s *MinRateScheduler) RecordSent(size int) {
 	}
 }
 
-func (s *MinRateScheduler) ConsumeDeficit() int {
+func (s *MinRateScheduler) Deficit() int {
 	deficit := s.TargetBytesPerTick() - s.sentTick
 	if deficit < 0 {
-		deficit = 0
+		return 0
 	}
+	return deficit
+}
+
+func (s *MinRateScheduler) ConsumeDeficit() int {
+	deficit := s.Deficit()
 	s.sentTick = 0
 	return deficit
 }
