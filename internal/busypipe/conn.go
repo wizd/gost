@@ -54,6 +54,12 @@ func ServerConn(raw net.Conn, cfg Config) (*Conn, error) {
 }
 
 func newConn(raw net.Conn, cfg Config, isClient bool) (*Conn, error) {
+	handshakeTimeout := time.Duration(cfg.IdleTimeoutMS) * time.Millisecond
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = time.Duration(DefaultIdleTimeoutMS) * time.Millisecond
+	}
+	_ = raw.SetDeadline(time.Now().Add(handshakeTimeout))
+
 	c := &Conn{
 		raw:       raw,
 		isClient:  isClient,
@@ -70,6 +76,7 @@ func newConn(raw net.Conn, cfg Config, isClient bool) (*Conn, error) {
 		raw.Close()
 		return nil, err
 	}
+	_ = raw.SetDeadline(time.Time{})
 
 	go c.readLoop()
 	go c.keepaliveLoop()
@@ -380,6 +387,7 @@ func (c *Conn) closeInternal(sendClose bool, cause error) {
 			cause = io.EOF
 		}
 		if sendClose {
+			_ = c.raw.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			_ = c.writeFrame(FrameCLOSE, nil, false)
 		}
 		close(c.closed)

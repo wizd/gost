@@ -57,22 +57,32 @@ func (l *bptlsListener) Init(m md.Metadata) (err error) {
 }
 
 func (l *bptlsListener) Accept() (net.Conn, error) {
-	conn, err := l.ln.Accept()
-	if err != nil {
-		return nil, err
-	}
-	if tc, ok := conn.(*tls.Conn); ok {
-		if err := tc.Handshake(); err != nil {
-			conn.Close()
+	for {
+		conn, err := l.ln.Accept()
+		if err != nil {
 			return nil, err
 		}
+		remoteAddr := conn.RemoteAddr()
+
+		if tc, ok := conn.(*tls.Conn); ok {
+			if err := tc.Handshake(); err != nil {
+				_ = conn.Close()
+				if l.logger != nil {
+					l.logger.Warnf("bptls tls handshake failed from %s: %v", remoteAddr, err)
+				}
+				continue
+			}
+		}
+
+		wrapped, err := busypipe.ServerConn(conn, l.md.cfg)
+		if err != nil {
+			if l.logger != nil {
+				l.logger.Warnf("bptls busypipe handshake failed from %s: %v", remoteAddr, err)
+			}
+			continue
+		}
+		return wrapped, nil
 	}
-	wrapped, err := busypipe.ServerConn(conn, l.md.cfg)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	return wrapped, nil
 }
 
 func (l *bptlsListener) Addr() net.Addr {

@@ -53,16 +53,22 @@ func (l *bpListener) Init(m md.Metadata) (err error) {
 }
 
 func (l *bpListener) Accept() (net.Conn, error) {
-	conn, err := l.ln.Accept()
-	if err != nil {
-		return nil, err
+	for {
+		conn, err := l.ln.Accept()
+		if err != nil {
+			return nil, err
+		}
+		remoteAddr := conn.RemoteAddr()
+
+		wrapped, err := busypipe.ServerConn(conn, l.md.cfg)
+		if err != nil {
+			if l.logger != nil {
+				l.logger.Warnf("bp busypipe handshake failed from %s: %v", remoteAddr, err)
+			}
+			continue
+		}
+		return wrapped, nil
 	}
-	wrapped, err := busypipe.ServerConn(conn, l.md.cfg)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	return wrapped, nil
 }
 
 func (l *bpListener) Addr() net.Addr {
