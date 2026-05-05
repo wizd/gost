@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/go-gost/core/listener"
 	"github.com/go-gost/core/logger"
@@ -21,6 +22,12 @@ type bpListener struct {
 	logger  logger.Logger
 	md      metadata
 	options listener.Options
+
+	startOnce sync.Once
+	closeOnce sync.Once
+	connCh    chan net.Conn
+	errCh     chan error
+	closeCh   chan struct{}
 }
 
 func NewListener(opts ...listener.Option) listener.Listener {
@@ -31,6 +38,9 @@ func NewListener(opts ...listener.Option) listener.Listener {
 	return &bpListener{
 		logger:  options.Logger,
 		options: options,
+		connCh:  make(chan net.Conn, 1024),
+		errCh:   make(chan error, 1),
+		closeCh: make(chan struct{}),
 	}
 }
 
@@ -53,21 +63,17 @@ func (l *bpListener) Init(m md.Metadata) (err error) {
 }
 
 func (l *bpListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.ln.Accept()
-		if err != nil {
-			return nil, err
-		}
-		remoteAddr := conn.RemoteAddr()
+	l.startOnce.Do(func() {
+		go l.acceptLoop()
+	})
 
-		wrapped, err := busypipe.ServerConn(conn, l.md.cfg)
-		if err != nil {
-			if l.logger != nil {
-				l.logger.Warnf("bp busypipe handshake failed from %s: %v", remoteAddr, err)
-			}
-			continue
-		}
-		return wrapped, nil
+	select {
+	case conn := <-l.connCh:
+		return conn, nil
+	case err := <-l.errCh:
+		return nil, err
+	case <-l.closeCh:
+		return nil, net.ErrClosed
 	}
 }
 
@@ -76,7 +82,51 @@ func (l *bpListener) Addr() net.Addr {
 }
 
 func (l *bpListener) Close() error {
+	l.closeOnce.Do(func() {
+		close(l.closeCh)
+	})
 	return l.ln.Close()
+}
+
+func (l *bpListener) acceptLoop() {
+	for {
+		conn, err := l.ln.Accept()
+		if err != nil {
+			select {
+			case <-l.closeCh:
+				return
+			default:
+			}
+			l.reportAcceptErr(err)
+			return
+		}
+		go l.handleConn(conn)
+	}
+}
+
+func (l *bpListener) handleConn(conn net.Conn) {
+	remoteAddr := conn.RemoteAddr()
+
+	wrapped, err := busypipe.ServerConn(conn, l.md.cfg)
+	if err != nil {
+		if l.logger != nil {
+			l.logger.Warnf("bp busypipe handshake failed from %s: %v", remoteAddr, err)
+		}
+		return
+	}
+
+	select {
+	case l.connCh <- wrapped:
+	case <-l.closeCh:
+		_ = wrapped.Close()
+	}
+}
+
+func (l *bpListener) reportAcceptErr(err error) {
+	select {
+	case l.errCh <- err:
+	default:
+	}
 }
 
 func isIPv4(addr string) bool {

@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"net"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-gost/core/listener"
 	"github.com/go-gost/core/logger"
@@ -22,6 +24,12 @@ type bptlsListener struct {
 	logger  logger.Logger
 	md      metadata
 	options listener.Options
+
+	startOnce sync.Once
+	closeOnce sync.Once
+	connCh    chan net.Conn
+	errCh     chan error
+	closeCh   chan struct{}
 }
 
 func NewListener(opts ...listener.Option) listener.Listener {
@@ -32,6 +40,9 @@ func NewListener(opts ...listener.Option) listener.Listener {
 	return &bptlsListener{
 		logger:  options.Logger,
 		options: options,
+		connCh:  make(chan net.Conn, 1024),
+		errCh:   make(chan error, 1),
+		closeCh: make(chan struct{}),
 	}
 }
 
@@ -57,31 +68,17 @@ func (l *bptlsListener) Init(m md.Metadata) (err error) {
 }
 
 func (l *bptlsListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.ln.Accept()
-		if err != nil {
-			return nil, err
-		}
-		remoteAddr := conn.RemoteAddr()
+	l.startOnce.Do(func() {
+		go l.acceptLoop()
+	})
 
-		if tc, ok := conn.(*tls.Conn); ok {
-			if err := tc.Handshake(); err != nil {
-				_ = conn.Close()
-				if l.logger != nil {
-					l.logger.Warnf("bptls tls handshake failed from %s: %v", remoteAddr, err)
-				}
-				continue
-			}
-		}
-
-		wrapped, err := busypipe.ServerConn(conn, l.md.cfg)
-		if err != nil {
-			if l.logger != nil {
-				l.logger.Warnf("bptls busypipe handshake failed from %s: %v", remoteAddr, err)
-			}
-			continue
-		}
-		return wrapped, nil
+	select {
+	case conn := <-l.connCh:
+		return conn, nil
+	case err := <-l.errCh:
+		return nil, err
+	case <-l.closeCh:
+		return nil, net.ErrClosed
 	}
 }
 
@@ -90,7 +87,69 @@ func (l *bptlsListener) Addr() net.Addr {
 }
 
 func (l *bptlsListener) Close() error {
+	l.closeOnce.Do(func() {
+		close(l.closeCh)
+	})
 	return l.ln.Close()
+}
+
+func (l *bptlsListener) acceptLoop() {
+	for {
+		conn, err := l.ln.Accept()
+		if err != nil {
+			select {
+			case <-l.closeCh:
+				return
+			default:
+			}
+			l.reportAcceptErr(err)
+			return
+		}
+		go l.handleConn(conn)
+	}
+}
+
+func (l *bptlsListener) handleConn(conn net.Conn) {
+	remoteAddr := conn.RemoteAddr()
+
+	timeout := time.Duration(l.md.cfg.IdleTimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = time.Duration(busypipe.DefaultIdleTimeoutMS) * time.Millisecond
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	if tc, ok := conn.(*tls.Conn); ok {
+		if err := tc.Handshake(); err != nil {
+			_ = conn.Close()
+			if l.logger != nil {
+				l.logger.Warnf("bptls tls handshake failed from %s: %v", remoteAddr, err)
+			}
+			return
+		}
+	}
+
+	_ = conn.SetDeadline(time.Time{})
+
+	wrapped, err := busypipe.ServerConn(conn, l.md.cfg)
+	if err != nil {
+		if l.logger != nil {
+			l.logger.Warnf("bptls busypipe handshake failed from %s: %v", remoteAddr, err)
+		}
+		return
+	}
+
+	select {
+	case l.connCh <- wrapped:
+	case <-l.closeCh:
+		_ = wrapped.Close()
+	}
+}
+
+func (l *bptlsListener) reportAcceptErr(err error) {
+	select {
+	case l.errCh <- err:
+	default:
+	}
 }
 
 func isIPv4(addr string) bool {
