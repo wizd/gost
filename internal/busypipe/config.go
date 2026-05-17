@@ -18,6 +18,7 @@ const (
 	DefaultMaxFrameSize  = 1400
 	DefaultIdleTimeoutMS = 15000
 	DefaultMinJitter     = 8
+	DefaultWarmupMS      = 3000
 )
 
 type Config struct {
@@ -27,6 +28,7 @@ type Config struct {
 	MaxFrameSize  int
 	IdleTimeoutMS int
 	MinJitter     int
+	WarmupMS      int
 }
 
 func DefaultConfig() Config {
@@ -37,6 +39,7 @@ func DefaultConfig() Config {
 		MaxFrameSize:  DefaultMaxFrameSize,
 		IdleTimeoutMS: DefaultIdleTimeoutMS,
 		MinJitter:     DefaultMinJitter,
+		WarmupMS:      DefaultWarmupMS,
 	}
 }
 
@@ -77,6 +80,12 @@ func ConfigFromMetadata(m md.Metadata) Config {
 		mdutil.GetInt(m, "min_jitter_bytes"),
 		cfg.MinJitter,
 	)
+	if mdutil.IsExists(m, "bp.warmupMs", "bp.warmup_ms", "warmupMs", "warmup_ms") {
+		cfg.WarmupMS = mdutil.GetInt(m, "bp.warmupMs", "bp.warmup_ms", "warmupMs", "warmup_ms")
+		if cfg.WarmupMS < 0 {
+			cfg.WarmupMS = 0
+		}
+	}
 	if cfg.MaxFrameSize < HeaderLen+1 {
 		cfg.MaxFrameSize = HeaderLen + 1
 	}
@@ -97,6 +106,7 @@ func (c Config) Negotiate(peer Config) (Config, error) {
 		MaxFrameSize:  minInt(c.MaxFrameSize, peer.MaxFrameSize),
 		IdleTimeoutMS: minInt(c.IdleTimeoutMS, peer.IdleTimeoutMS),
 		MinJitter:     maxInt(c.MinJitter, peer.MinJitter),
+		WarmupMS:      maxInt(c.WarmupMS, peer.WarmupMS),
 	}
 	if out.MaxFrameSize < HeaderLen+1 {
 		out.MaxFrameSize = HeaderLen + 1

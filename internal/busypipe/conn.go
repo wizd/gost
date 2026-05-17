@@ -18,6 +18,7 @@ type helloPayload struct {
 	MaxFrameSize  int   `json:"max_frame_size"`
 	IdleTimeoutMS int   `json:"idle_timeout_ms"`
 	MinJitter     int   `json:"min_jitter_bytes"`
+	WarmupMS      int   `json:"warmup_ms"`
 }
 
 type Conn struct {
@@ -30,6 +31,11 @@ type Conn struct {
 	mixed     *MixedBuilder
 
 	writeMu sync.Mutex
+
+	warmupUntil     time.Time
+	writeDeadlineMu sync.Mutex
+	writeDeadline   time.Time
+	writeDeadlineCh chan struct{}
 
 	readMu       sync.Mutex
 	readCond     *sync.Cond
@@ -61,14 +67,15 @@ func newConn(raw net.Conn, cfg Config, isClient bool) (*Conn, error) {
 	_ = raw.SetDeadline(time.Now().Add(handshakeTimeout))
 
 	c := &Conn{
-		raw:       raw,
-		isClient:  isClient,
-		cfg:       cfg,
-		codec:     NewCodec(cfg.MaxFrameSize),
-		scheduler: NewMinRateScheduler(cfg.MinBPS, cfg.TickMS),
-		mixed:     NewMixedBuilder(cfg.MinJitter),
-		closed:    make(chan struct{}),
-		lastRecv:  time.Now(),
+		raw:             raw,
+		isClient:        isClient,
+		cfg:             cfg,
+		codec:           NewCodec(cfg.MaxFrameSize),
+		scheduler:       NewMinRateScheduler(cfg.MinBPS, cfg.TickMS),
+		mixed:           NewMixedBuilder(cfg.MinJitter),
+		closed:          make(chan struct{}),
+		lastRecv:        time.Now(),
+		writeDeadlineCh: make(chan struct{}),
 	}
 	c.readCond = sync.NewCond(&c.readMu)
 
@@ -93,6 +100,7 @@ func (c *Conn) handshake() error {
 		MaxFrameSize:  c.cfg.MaxFrameSize,
 		IdleTimeoutMS: c.cfg.IdleTimeoutMS,
 		MinJitter:     c.cfg.MinJitter,
+		WarmupMS:      c.cfg.WarmupMS,
 	}
 	payload, err := json.Marshal(hello)
 	if err != nil {
@@ -120,6 +128,7 @@ func (c *Conn) handshake() error {
 		MaxFrameSize:  peer.MaxFrameSize,
 		IdleTimeoutMS: peer.IdleTimeoutMS,
 		MinJitter:     peer.MinJitter,
+		WarmupMS:      peer.WarmupMS,
 	})
 	if err != nil {
 		return err
@@ -128,6 +137,11 @@ func (c *Conn) handshake() error {
 	c.codec.SetMaxFrameSize(negotiated.MaxFrameSize)
 	c.scheduler = NewMinRateScheduler(negotiated.MinBPS, negotiated.TickMS)
 	c.mixed = NewMixedBuilder(negotiated.MinJitter)
+	if negotiated.WarmupMS > 0 {
+		c.warmupUntil = time.Now().Add(time.Duration(negotiated.WarmupMS) * time.Millisecond)
+	} else {
+		c.warmupUntil = time.Time{}
+	}
 	c.touchRecv()
 	return nil
 }
@@ -163,6 +177,9 @@ func (c *Conn) Write(p []byte) (int, error) {
 	case <-c.closed:
 		return 0, net.ErrClosed
 	default:
+	}
+	if err := c.waitWarmup(); err != nil {
+		return 0, err
 	}
 
 	written := 0
@@ -252,7 +269,15 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	return c.raw.SetWriteDeadline(t)
+	if err := c.raw.SetWriteDeadline(t); err != nil {
+		return err
+	}
+	c.writeDeadlineMu.Lock()
+	c.writeDeadline = t
+	close(c.writeDeadlineCh)
+	c.writeDeadlineCh = make(chan struct{})
+	c.writeDeadlineMu.Unlock()
+	return nil
 }
 
 type timeoutError struct{}
@@ -267,6 +292,49 @@ func (timeoutError) Timeout() bool {
 
 func (timeoutError) Temporary() bool {
 	return true
+}
+
+func (c *Conn) waitWarmup() error {
+	for {
+		if c.warmupUntil.IsZero() {
+			return nil
+		}
+		remaining := time.Until(c.warmupUntil)
+		if remaining <= 0 {
+			return nil
+		}
+
+		deadline, deadlineCh := c.currentWriteDeadline()
+		if !deadline.IsZero() {
+			d := time.Until(deadline)
+			if d <= 0 {
+				return timeoutError{}
+			}
+			if d < remaining {
+				remaining = d
+			}
+		}
+
+		timer := time.NewTimer(remaining)
+		select {
+		case <-timer.C:
+		case <-c.closed:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return net.ErrClosed
+		case <-deadlineCh:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		}
+	}
+}
+
+func (c *Conn) currentWriteDeadline() (time.Time, chan struct{}) {
+	c.writeDeadlineMu.Lock()
+	defer c.writeDeadlineMu.Unlock()
+	return c.writeDeadline, c.writeDeadlineCh
 }
 
 func (c *Conn) readLoop() {
