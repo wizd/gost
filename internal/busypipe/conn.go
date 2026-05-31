@@ -39,9 +39,11 @@ type Conn struct {
 
 	readMu       sync.Mutex
 	readCond     *sync.Cond
+	readNotFull  *sync.Cond
 	readBuf      bytes.Buffer
 	readErr      error
 	readDeadline time.Time
+	readBufLimit int
 
 	lastRecvMu sync.Mutex
 	lastRecv   time.Time
@@ -60,6 +62,8 @@ func ServerConn(raw net.Conn, cfg Config) (*Conn, error) {
 }
 
 func newConn(raw net.Conn, cfg Config, isClient bool) (*Conn, error) {
+	enableTCPKeepAlive(raw)
+
 	handshakeTimeout := time.Duration(cfg.IdleTimeoutMS) * time.Millisecond
 	if handshakeTimeout <= 0 {
 		handshakeTimeout = time.Duration(DefaultIdleTimeoutMS) * time.Millisecond
@@ -76,8 +80,10 @@ func newConn(raw net.Conn, cfg Config, isClient bool) (*Conn, error) {
 		closed:          make(chan struct{}),
 		lastRecv:        time.Now(),
 		writeDeadlineCh: make(chan struct{}),
+		readBufLimit:    cfg.ReadBufferBytes,
 	}
 	c.readCond = sync.NewCond(&c.readMu)
+	c.readNotFull = sync.NewCond(&c.readMu)
 
 	if err := c.handshake(); err != nil {
 		raw.Close()
@@ -169,7 +175,10 @@ func (c *Conn) Read(p []byte) (int, error) {
 	if c.readBuf.Len() == 0 && c.readErr != nil {
 		return 0, c.readErr
 	}
-	return c.readBuf.Read(p)
+	n, err := c.readBuf.Read(p)
+	// 消费后唤醒等待容量的 readLoop（pushReadData）。
+	c.readNotFull.Broadcast()
+	return n, err
 }
 
 func (c *Conn) Write(p []byte) (int, error) {
@@ -387,8 +396,10 @@ func (c *Conn) keepaliveLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			deficit := c.scheduler.ConsumeDeficit()
+			// 先只读 Deficit，不重置 sentTick，避免与业务 Write 竞争丢字节。
+			deficit := c.scheduler.Deficit()
 			if deficit <= 0 {
+				c.scheduler.ConsumeDeficit()
 				continue
 			}
 			payloadLen := deficit - HeaderLen
@@ -405,10 +416,19 @@ func (c *Conn) keepaliveLoop() {
 					return
 				}
 			}
-			if err := c.writeFrame(FramePAD, pad, true); err != nil {
+			// 业务 Write 持锁时跳过本 tick 的 PAD，下一 tick 再补。
+			// 协议允许背压时跳过 PAD（见 protocol.md 中调度规则）。
+			ok, err := c.tryWriteFramePAD(pad)
+			if err != nil {
 				c.closeInternal(false, err)
 				return
 			}
+			if ok {
+				// 真正写出了 PAD，本 tick 计数清零，下个 tick 重新核算。
+				c.scheduler.ConsumeDeficit()
+			}
+			// 未写出时保留 sentTick：业务字节继续累计，避免错误地把
+			// 业务写计数清零导致后续 tick 估算偏高。
 		case <-c.closed:
 			return
 		}
@@ -430,6 +450,11 @@ func (c *Conn) idleLoop() {
 			idle := time.Since(c.lastRecv)
 			c.lastRecvMu.Unlock()
 			if idle > timeout {
+				// 当接收缓冲已满时，readLoop 会在 pushReadData 上阻塞，
+				// 由应用层消费速度决定恢复时间。此时不应误判为链路 idle。
+				if c.isReadBackpressured() {
+					continue
+				}
 				c.closeInternal(false, errors.New("busypipe: idle timeout"))
 				return
 			}
@@ -437,6 +462,14 @@ func (c *Conn) idleLoop() {
 			return
 		}
 	}
+}
+
+func (c *Conn) isReadBackpressured() bool {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	return c.readBufLimit > 0 &&
+		c.readBuf.Len() >= c.readBufLimit &&
+		c.readErr == nil
 }
 
 func (c *Conn) touchRecv() {
@@ -450,25 +483,83 @@ func (c *Conn) pushReadData(data []byte) {
 		return
 	}
 	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	// 背压：当 readBuf 达到上限且未关闭/未出错时，readLoop 在此阻塞，
+	// 把压力传回 TCP 接收窗口，避免无界内存膨胀。
+	for c.readBufLimit > 0 &&
+		c.readBuf.Len() >= c.readBufLimit &&
+		c.readErr == nil {
+		c.readNotFull.Wait()
+	}
+	if c.readErr != nil {
+		// 连接已关闭/出错，丢弃数据并结束等待。
+		return
+	}
 	c.readBuf.Write(data)
 	c.readCond.Signal()
-	c.readMu.Unlock()
 }
 
+// writeFrame 串行化向底层 raw 连接写入一个完整帧。
+//
+// 关键约束：
+//   - 帧编码错误或 raw.Write 错误都会立刻关闭连接，避免下一次 Write 把后续帧
+//     拼接到一个已经损坏（部分写入）的 stream 上，导致对端 magic/crc 校验失败。
+//   - Conn.Write 在多帧循环中不持有 writeMu，因此 keepaliveLoop 可以在帧之间
+//     抢锁插入 PAD；这是把背压传回 TCP 缓冲的关键。
 func (c *Conn) writeFrame(t FrameType, payload []byte, recordRate bool) error {
+	if err := c.writeFrameRaw(t, payload, recordRate); err != nil {
+		c.closeInternal(false, err)
+		return err
+	}
+	return nil
+}
+
+// writeFrameRaw 编码并发送一个帧，但不在错误路径上触发 closeInternal。
+// 该函数允许 closeInternal 在 sendClose 路径下安全地发送 FrameCLOSE
+// 而不会因 sync.Once 嵌套调用产生死锁。
+func (c *Conn) writeFrameRaw(t FrameType, payload []byte, recordRate bool) error {
 	frame, err := c.codec.Encode(t, payload, 0)
 	if err != nil {
 		return err
 	}
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if _, err := c.raw.Write(frame); err != nil {
+	n, err := c.raw.Write(frame)
+	c.writeMu.Unlock()
+	if err != nil {
 		return err
+	}
+	if n != len(frame) {
+		// net.Conn.Write 在没有 deadline 的情况下会写完或返回错误；
+		// 出现部分写说明底层有非预期行为，立即关闭以保护 stream 完整性。
+		return io.ErrShortWrite
 	}
 	if recordRate {
 		c.scheduler.RecordSent(len(frame))
 	}
 	return nil
+}
+
+// tryWriteFramePAD 仅用于 keepalive 调度器：抢不到 writeMu 时立即返回，
+// 让出本 tick 的 PAD，避免与业务 Write 互相饿死或在 TCP 拥塞时无限堆积。
+// 返回值表示是否实际写出；非 nil err 表示底层连接已无法继续使用。
+func (c *Conn) tryWriteFramePAD(payload []byte) (bool, error) {
+	frame, err := c.codec.Encode(FramePAD, payload, 0)
+	if err != nil {
+		return false, err
+	}
+	if !c.writeMu.TryLock() {
+		return false, nil
+	}
+	n, werr := c.raw.Write(frame)
+	c.writeMu.Unlock()
+	if werr != nil {
+		return false, werr
+	}
+	if n != len(frame) {
+		return false, io.ErrShortWrite
+	}
+	c.scheduler.RecordSent(len(frame))
+	return true, nil
 }
 
 func (c *Conn) closeInternal(sendClose bool, cause error) {
@@ -478,7 +569,8 @@ func (c *Conn) closeInternal(sendClose bool, cause error) {
 		}
 		if sendClose {
 			_ = c.raw.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			_ = c.writeFrame(FrameCLOSE, nil, false)
+			// 使用 writeFrameRaw 避免重入 closeInternal（sync.Once 同 goroutine 嵌套会死锁）。
+			_ = c.writeFrameRaw(FrameCLOSE, nil, false)
 		}
 		close(c.closed)
 		_ = c.raw.Close()
@@ -488,6 +580,22 @@ func (c *Conn) closeInternal(sendClose bool, cause error) {
 			c.readErr = cause
 		}
 		c.readCond.Broadcast()
+		c.readNotFull.Broadcast()
 		c.readMu.Unlock()
 	})
+}
+
+func enableTCPKeepAlive(conn net.Conn) {
+	for conn != nil {
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(60 * time.Second)
+			return
+		}
+		nc, ok := conn.(interface{ NetConn() net.Conn })
+		if !ok {
+			return
+		}
+		conn = nc.NetConn()
+	}
 }

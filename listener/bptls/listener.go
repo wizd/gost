@@ -12,6 +12,7 @@ import (
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
 	"github.com/go-gost/gost/internal/busypipe"
+	"github.com/go-gost/gost/internal/sockopt"
 	"github.com/go-gost/x/registry"
 )
 
@@ -59,6 +60,7 @@ func (l *bptlsListener) Init(m md.Metadata) (err error) {
 		lc.SetMultipathTCP(true)
 		l.logger.Debugf("mptcp enabled: %v", lc.MultipathTCP())
 	}
+	lc.Control = sockopt.ListenConfigControlForMaxSeg(l.md.tcpMaxSeg)
 	ln, err := lc.Listen(context.Background(), network, l.options.Addr)
 	if err != nil {
 		return err
@@ -111,6 +113,15 @@ func (l *bptlsListener) acceptLoop() {
 
 func (l *bptlsListener) handleConn(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
+	if err := sockopt.SetMaxSeg(conn, l.md.tcpMaxSeg); err != nil && l.logger != nil {
+		l.logger.Debugf("set TCP_MAXSEG failed from %s: %v", remoteAddr, err)
+	}
+	if err := sockopt.SetNoDelay(conn, l.md.noDelay); err != nil && l.logger != nil {
+		l.logger.Debugf("set TCP_NODELAY failed from %s: %v", remoteAddr, err)
+	}
+	if err := sockopt.SetBuffers(conn, l.md.sndBuf, l.md.rcvBuf); err != nil && l.logger != nil {
+		l.logger.Debugf("set TCP buffers failed from %s: %v", remoteAddr, err)
+	}
 
 	timeout := time.Duration(l.md.cfg.IdleTimeoutMS) * time.Millisecond
 	if timeout <= 0 {

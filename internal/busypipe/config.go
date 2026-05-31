@@ -19,6 +19,9 @@ const (
 	DefaultIdleTimeoutMS = 15000
 	DefaultMinJitter     = 8
 	DefaultWarmupMS      = 3000
+	// DefaultReadBufferBytes 默认 256 KB；超过该上限时 readLoop 阻塞，
+	// 把背压从进程内存压回 TCP 接收窗口。
+	DefaultReadBufferBytes = 256 * 1024
 )
 
 type Config struct {
@@ -29,17 +32,21 @@ type Config struct {
 	IdleTimeoutMS int
 	MinJitter     int
 	WarmupMS      int
+	// ReadBufferBytes 控制接收侧已解码但未被上层消费的最大字节数。
+	// <=0 表示不限制（不推荐，会丢失背压能力）。
+	ReadBufferBytes int
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Version:       Version,
-		MinBPS:        DefaultMinBPS,
-		TickMS:        DefaultTickMS,
-		MaxFrameSize:  DefaultMaxFrameSize,
-		IdleTimeoutMS: DefaultIdleTimeoutMS,
-		MinJitter:     DefaultMinJitter,
-		WarmupMS:      DefaultWarmupMS,
+		Version:         Version,
+		MinBPS:          DefaultMinBPS,
+		TickMS:          DefaultTickMS,
+		MaxFrameSize:    DefaultMaxFrameSize,
+		IdleTimeoutMS:   DefaultIdleTimeoutMS,
+		MinJitter:       DefaultMinJitter,
+		WarmupMS:        DefaultWarmupMS,
+		ReadBufferBytes: DefaultReadBufferBytes,
 	}
 }
 
@@ -84,6 +91,18 @@ func ConfigFromMetadata(m md.Metadata) Config {
 		cfg.WarmupMS = mdutil.GetInt(m, "bp.warmupMs", "bp.warmup_ms", "warmupMs", "warmup_ms")
 		if cfg.WarmupMS < 0 {
 			cfg.WarmupMS = 0
+		}
+	}
+	if mdutil.IsExists(m,
+		"bp.readBufferBytes", "bp.read_buffer_bytes",
+		"readBufferBytes", "read_buffer_bytes",
+	) {
+		cfg.ReadBufferBytes = mdutil.GetInt(m,
+			"bp.readBufferBytes", "bp.read_buffer_bytes",
+			"readBufferBytes", "read_buffer_bytes",
+		)
+		if cfg.ReadBufferBytes < 0 {
+			cfg.ReadBufferBytes = 0
 		}
 	}
 	if cfg.MaxFrameSize < HeaderLen+1 {

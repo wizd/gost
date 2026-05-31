@@ -110,11 +110,12 @@ func (c *udpConn) Write(b []byte) (n int, err error) {
 
 	var bb [2]byte
 	binary.BigEndian.PutUint16(bb[:], uint16(len(b)))
-	_, err = c.Conn.Write(bb[:])
-	if err != nil {
-		return
-	}
-	return c.Conn.Write(b)
+	buf := bufpool.Get(len(b) + 2)
+	defer bufpool.Put(buf)
+	copy(buf[:2], bb[:])
+	copy(buf[2:], b)
+	_, err = c.Conn.Write(buf)
+	return
 }
 
 func readResponse(r io.Reader) (err error) {
