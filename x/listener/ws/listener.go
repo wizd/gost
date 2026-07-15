@@ -2,9 +2,11 @@ package ws
 
 import (
 	"context"
+	stdlog "log"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strings"
 	"time"
 
 	"github.com/go-gost/core/limiter"
@@ -85,6 +87,12 @@ func (l *wsListener) Init(md md.Metadata) (err error) {
 		Addr:              l.options.Addr,
 		Handler:           mux,
 		ReadHeaderTimeout: l.md.readHeaderTimeout,
+		// Route HTTP server errors (TLS handshake failures, malformed
+		// requests) to the GOST logger instead of the default stderr
+		// output via log.Printf. Without this, network scanners and
+		// protocol filters probing the WSS port produce uncontrolled
+		// noise: "http: TLS handshake error from ...".
+		ErrorLog: stdlog.New(&logWriter{log: l.log}, "", 0),
 	}
 
 	l.cqueue = make(chan net.Conn, l.md.backlog)
@@ -103,6 +111,16 @@ func (l *wsListener) Init(md md.Metadata) (err error) {
 	ln, err := lc.Listen(context.Background(), network, l.options.Addr)
 	if err != nil {
 		return
+	}
+	if l.md.keepalive {
+		ln = xnet.WrapKeepaliveListener(ln, net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     l.md.keepaliveIdle,
+			Interval: l.md.keepaliveInterval,
+			Count:    l.md.keepaliveCount,
+		})
+		l.log.Debugf("tcp keepalive enabled: idle=%v interval=%v count=%d",
+			l.md.keepaliveIdle, l.md.keepaliveInterval, l.md.keepaliveCount)
 	}
 	ln = proxyproto.WrapListener(l.options.ProxyProtocol, ln, 10*time.Second)
 	ln = metrics.WrapListener(l.options.Service, ln)
@@ -176,7 +194,9 @@ func (l *wsListener) upgrade(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := l.upgrader.Upgrade(w, r, l.md.header)
 	if err != nil {
-		log.Error(err)
+		// Upgrade failures (plain HTTP requests, websocket
+		// handshake errors) are operational noise — log at Warn.
+		log.Warn(err)
 		return
 	}
 
@@ -197,4 +217,18 @@ func (l *wsListener) upgrade(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		log.Warnf("connection queue is full, client %s discarded", conn.RemoteAddr())
 	}
+}
+
+// logWriter adapts a GOST logger to the io.Writer interface required by
+// http.Server.ErrorLog. It writes each log entry as a Debug-level message
+// so that HTTP server errors (TLS handshake failures, malformed requests)
+// are captured in GOST's logging pipeline instead of escaping to stderr
+// via log.Printf.
+type logWriter struct {
+	log logger.Logger
+}
+
+func (w *logWriter) Write(p []byte) (n int, err error) {
+	w.log.Debug(strings.TrimSpace(string(p)))
+	return len(p), nil
 }

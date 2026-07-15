@@ -10,6 +10,7 @@ import (
 	"github.com/go-gost/core/dialer"
 	md "github.com/go-gost/core/metadata"
 	xctx "github.com/go-gost/x/ctx"
+	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/net/proxyproto"
 	ssh_util "github.com/go-gost/x/internal/util/ssh"
 	"github.com/go-gost/x/registry"
@@ -62,6 +63,18 @@ func (d *sshdDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 		delete(d.sessions, addr) // session is dead
 		ok = false
 	}
+	if ok {
+		// Health check: verify the cached session is still alive before
+		// returning it. A dead-but-not-yet-detected session (e.g. idle
+		// connection silently dropped by NAT) would cause "ssh: unexpected
+		// packet in response to channel open" later in the connector.
+		if err := session.Ping(d.md.keepaliveTimeout); err != nil {
+			d.options.Logger.Debugf("sshd session ping failed: %v, recreating", err)
+			session.Close()
+			delete(d.sessions, addr)
+			ok = false
+		}
+	}
 	if !ok {
 		var options dialer.DialOptions
 		for _, opt := range opts {
@@ -71,6 +84,14 @@ func (d *sshdDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 		conn, err = options.Dialer.Dial(ctx, "tcp", addr)
 		if err != nil {
 			return
+		}
+		if d.md.tcpKeepalive {
+			xnet.ApplyKeepalive(conn, net.KeepAliveConfig{
+				Enable:   true,
+				Idle:     d.md.tcpKeepaliveIdle,
+				Interval: d.md.tcpKeepaliveInterval,
+				Count:    d.md.tcpKeepaliveCount,
+			})
 		}
 
 		if d.md.handshakeTimeout > 0 {

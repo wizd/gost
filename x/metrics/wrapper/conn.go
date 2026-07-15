@@ -26,6 +26,8 @@ type serverConn struct {
 	clientIP string
 }
 
+// WrapConn wraps a net.Conn with metrics tracking. Bytes read/written are
+// counted as service transfer input/output. If c is nil, nil is returned.
 func WrapConn(service string, c net.Conn) net.Conn {
 	if c == nil {
 		return c
@@ -38,6 +40,12 @@ func WrapConn(service string, c net.Conn) net.Conn {
 		Conn:     c,
 		clientIP: host,
 	}
+}
+
+// UnwrapConn returns the underlying connection, allowing type assertions
+// through wrapper layers.
+func (c *serverConn) UnwrapConn() net.Conn {
+	return c.Conn
 }
 
 func (c *serverConn) Read(b []byte) (n int, err error) {
@@ -101,6 +109,8 @@ type packetConn struct {
 	service string
 }
 
+// WrapPacketConn wraps a net.PacketConn with metrics tracking. Bytes read/written
+// are counted as service transfer input/output. If pc is nil, nil is returned.
 func WrapPacketConn(service string, pc net.PacketConn) net.PacketConn {
 	if pc == nil {
 		return pc
@@ -161,7 +171,13 @@ type udpConn struct {
 	service string
 }
 
+// WrapUDPConn wraps a net.PacketConn as a udp.Conn with metrics tracking. Bytes
+// read/written are counted as service transfer input/output. If pc is nil, nil
+// is returned.
 func WrapUDPConn(service string, pc net.PacketConn) udp.Conn {
+	if pc == nil {
+		return nil
+	}
 	return &udpConn{
 		PacketConn: pc,
 		service:    service,
@@ -377,7 +393,7 @@ func (c *udpConn) SetDSCP(n int) error {
 	if nc, ok := c.PacketConn.(xnet.SetDSCP); ok {
 		return nc.SetDSCP(n)
 	}
-	return nil
+	return errUnsupport
 }
 
 func (c *udpConn) Context() context.Context {

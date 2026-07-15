@@ -59,9 +59,22 @@ func (l *mtcpListener) Init(md md.Metadata) (err error) {
 		lc.SetMultipathTCP(true)
 		l.logger.Debugf("mptcp enabled: %v", lc.MultipathTCP())
 	}
+	if l.md.reuseport {
+		lc.Control = l.setReusePort
+	}
 	ln, err := lc.Listen(context.Background(), network, l.options.Addr)
 	if err != nil {
 		return
+	}
+	if l.md.keepalive {
+		ln = xnet.WrapKeepaliveListener(ln, net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     l.md.keepaliveIdle,
+			Interval: l.md.keepaliveInterval,
+			Count:    l.md.keepaliveCount,
+		})
+		l.logger.Debugf("tcp keepalive enabled: idle=%v interval=%v count=%d",
+			l.md.keepaliveIdle, l.md.keepaliveInterval, l.md.keepaliveCount)
 	}
 
 	l.logger.Debugf("pp: %d", l.options.ProxyProtocol)

@@ -38,6 +38,10 @@ type matcher struct {
 	tree matchersTree
 }
 
+// NewMatcher parses a routing rule string and returns a routing.Matcher.
+// The rule syntax supports boolean expressions with matchers like
+// Host(`example.com`), Path(`/api`), Method(`GET`), etc., combined
+// with &&, ||, and ! operators.
 func NewMatcher(rule string) (routing.Matcher, error) {
 	parse, err := defaultParser.Parse(rule)
 	if err != nil {
@@ -140,6 +144,7 @@ func (m *matchersTree) addRule(rule *rules.Tree, funcs matcherFuncs) error {
 
 var httpFuncs = map[string]func(*matchersTree, ...string) error{
 	"ClientIP":     expectNParameters(clientIP, 1),
+	"Network":      expectNParameters(network, 1),
 	"Proto":        expectNParameters(proto, 1),
 	"Host":         expectNParameters(host, 1),
 	"HostRegexp":   expectNParameters(hostRegexp, 1),
@@ -151,6 +156,7 @@ var httpFuncs = map[string]func(*matchersTree, ...string) error{
 	"HeaderRegexp": expectNParameters(headerRegexp, 1, 2),
 	"Query":        expectNParameters(query, 1, 2),
 	"QueryRegexp":  expectNParameters(queryRegexp, 1, 2),
+	"BodyRegexp":   expectNParameters(bodyRegexp, 1),
 	"Bypass":       expectNParameters(bypass, 1),
 	"Admission":    expectNParameters(admission, 1),
 }
@@ -202,6 +208,18 @@ func proto(tree *matchersTree, protos ...string) error {
 	return nil
 }
 
+func network(tree *matchersTree, networks ...string) error {
+	network := strings.ToLower(networks[0])
+
+	tree.matcher = func(req *routing.Request) bool {
+		// Use prefix match so Network("tcp") matches "tcp", "tcp4", "tcp6"
+		// and Network("udp") matches "udp", "udp4", "udp6".
+		return strings.HasPrefix(req.Network, network)
+	}
+
+	return nil
+}
+
 func method(tree *matchersTree, methods ...string) error {
 	method := strings.ToUpper(methods[0])
 
@@ -239,7 +257,7 @@ func host(tree *matchersTree, hosts ...string) error {
 			return true
 		}
 
-		if host[0] == '.' && strings.HasSuffix(reqHost, host[1:]) {
+		if host[0] == '.' && strings.HasSuffix(reqHost, host) {
 			return true
 		}
 
@@ -288,7 +306,7 @@ func pathRegexp(tree *matchersTree, paths ...string) error {
 
 	re, err := regexp.Compile(path)
 	if err != nil {
-		return fmt.Errorf("compiling PathPrefix matcher: %w", err)
+		return fmt.Errorf("compiling PathRegexp matcher: %w", err)
 	}
 
 	tree.matcher = func(req *routing.Request) bool {
@@ -439,6 +457,22 @@ func queryRegexp(tree *matchersTree, queries ...string) error {
 	return nil
 }
 
+func bodyRegexp(tree *matchersTree, patterns ...string) error {
+	re, err := regexp.Compile(patterns[0])
+	if err != nil {
+		return fmt.Errorf("compiling BodyRegexp matcher: %w", err)
+	}
+
+	tree.matcher = func(req *routing.Request) bool {
+		if len(req.Body) == 0 {
+			return false
+		}
+		return re.Match(req.Body)
+	}
+
+	return nil
+}
+
 func admission(tree *matchersTree, names ...string) error {
 	name := names[0]
 
@@ -447,7 +481,7 @@ func admission(tree *matchersTree, names ...string) error {
 			return false
 		}
 		if adm := registry.AdmissionRegistry().Get(name); adm != nil {
-			return adm.Admit(context.Background(), req.ClientIP.String())
+			return adm.Admit(context.Background(), "ip", req.ClientIP.String())
 		}
 		return false
 	}

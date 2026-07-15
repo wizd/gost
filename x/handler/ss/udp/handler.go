@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
-	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-gost/core/bypass"
-	"github.com/go-gost/core/common/bufpool"
 	"github.com/go-gost/core/handler"
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
@@ -19,7 +19,9 @@ import (
 	"github.com/go-gost/go-shadowsocks2/utils"
 	xctx "github.com/go-gost/x/ctx"
 	ictx "github.com/go-gost/x/internal/ctx"
+	"github.com/go-gost/x/internal/net/udp"
 	"github.com/go-gost/x/internal/util/relay"
+	"github.com/go-gost/x/internal/util/ss/none"
 	rate_limiter "github.com/go-gost/x/limiter/rate"
 	xrecorder "github.com/go-gost/x/recorder"
 	"github.com/go-gost/x/registry"
@@ -36,6 +38,7 @@ type ssuHandler struct {
 	md        metadata
 	options   handler.Options
 	recorder  recorder.RecorderObject
+	cancels   sync.Map // session hash -> context.CancelFunc
 }
 
 func NewHandler(opts ...handler.Option) handler.Handler {
@@ -54,22 +57,39 @@ func (h *ssuHandler) Init(md md.Metadata) (err error) {
 		return
 	}
 
-	if h.options.Auth != nil {
-		method := h.options.Auth.Username()
-		password, _ := h.options.Auth.Password()
+	if h.options.Auth == nil {
+		return errors.New("ss: auth is required")
+	}
 
+	method := h.options.Auth.Username()
+	password, _ := h.options.Auth.Password()
+
+	if strings.EqualFold(method, "none") || strings.EqualFold(method, "dummy") {
+		c := core.ServerConfig{Cipher: none.Cipher, Users: h.md.users, UDPTimeout: time.Minute}
+		h.udpServer = core.NewUDPServer(c)
+		err = h.udpServer.Init()
+		if err != nil {
+			return err
+		}
+		h.tcpServer = core.NewTCPServer(c)
+		err = h.tcpServer.Init()
+		if err != nil {
+			return err
+		}
+	} else {
 		serverConfig, err := utils.NewServerConfig(method, password, h.md.users)
 		if err != nil {
 			return err
 		}
-		h.udpServer = core.NewUDPServer(serverConfig, time.Duration(60*time.Second))
+		serverConfig.UDPTimeout = time.Minute
+		h.udpServer = core.NewUDPServer(serverConfig)
 		err = h.udpServer.Init()
 		if err != nil {
 			return err
 		}
 
 		h.tcpServer = core.NewTCPServer(serverConfig)
-		err = h.udpServer.Init()
+		err = h.tcpServer.Init()
 		if err != nil {
 			return err
 		}
@@ -141,196 +161,175 @@ func (h *ssuHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.
 		// WriteTo will write data to original remote addr instead of the addr parameter passed to
 		pc = relay.UDPTunServerConn(conn)
 
-		return h.relayPacketTCP(ctx, pc, ro, log)
-	} else {
-		return h.relayPacketUDP(ctx, pc, ro, log)
-	}
-}
-
-// UDP over TCP
-func (h *ssuHandler) relayPacketTCP(ctx context.Context, src net.PacketConn, ro *xrecorder.HandlerRecorderObject, log logger.Logger) error {
-	bufferSize := h.md.udpBufferSize
-	if bufferSize <= 0 {
-		bufferSize = defaultBufferSize
-	}
-
-	b := bufpool.Get(bufferSize)
-	defer bufpool.Put(b)
-
-	var dstConn net.Conn
-	defer func() {
-		if dstConn != nil {
-			dstConn.Close()
-		}
-	}()
-
-	for {
-		n, targetAddr, err := src.ReadFrom(b)
+		// UDP over TCP still behaves like a regular packet tunnel.
+		var buf bytes.Buffer
+		c, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), "udp", "")
+		ro.Route = buf.String()
 		if err != nil {
+			log.Error(err)
+			return err
+		}
+		defer c.Close()
+
+		cc, ok := c.(net.PacketConn)
+		if !ok {
+			err := errors.New("ss: wrong connection type")
+			log.Error(err)
 			return err
 		}
 
-		if ro.Host == "" {
-			ro.Host = targetAddr.String()
-		}
+		r := udp.NewRelay(pc, cc).
+			WithService(h.options.Service).
+			WithBypass(h.options.Bypass).
+			WithBufferSize(h.md.udpBufferSize).
+			WithLogger(log)
 
-		if h.options.Bypass != nil && h.options.Bypass.Contains(ctx, targetAddr.Network(), targetAddr.String(), bypass.WithService(h.options.Service)) {
-			log.Warn("bypass: ", targetAddr)
-			return nil
-		}
-
-		if dstConn == nil {
-			// obtain a udp connection
-			var buf bytes.Buffer
-			dstConn, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), "udp", "") // UDP association
-			ro.Route = buf.String()
-			if err != nil {
-				log.Error(err)
-				return err
-			}
-
-			cc, ok := dstConn.(net.PacketConn)
-			if !ok {
-				err := errors.New("ss: wrong connection type")
-				log.Error(err)
-				return err
-			}
-
-			log.Infof("%s <-> %s", src.LocalAddr(), cc.LocalAddr())
-
-			go func() {
-				defer dstConn.Close()
-				for {
-					n, raddr, err := cc.ReadFrom(b)
-					if err != nil {
-						log.Warnf("failed to read response from %v: %v", raddr, err)
-						return
-					}
-
-					if h.options.Bypass != nil && h.options.Bypass.Contains(ctx, raddr.Network(), raddr.String(), bypass.WithService(h.options.Service)) {
-						log.Warn("bypass: ", raddr)
-						return
-					}
-
-					if _, err = src.WriteTo(b[:n], targetAddr); err != nil {
-						log.Warnf("failed to write response from %v: %v", targetAddr, err)
-						return
-					}
-
-					log.Tracef("%s <<< %s data: %d",
-						cc.LocalAddr(), raddr, n)
-				}
-			}()
-		}
-
-		if _, err = dstConn.(net.PacketConn).WriteTo(b[:n], targetAddr); err != nil {
-			return err
-		}
-
-		log.Tracef("%s >>> %s data: %d",
-			dstConn.(net.PacketConn).LocalAddr(), targetAddr, n)
+		return r.Run(ctx)
 	}
+
+	return h.relayPacketUDP(ctx, h.udpServer.WrapConn(pc), ro, log)
 }
 
-// standard udp relay
-// Dataflow: src (encrypted data) <-> dst (plaintext data)
 func (h *ssuHandler) relayPacketUDP(ctx context.Context, src net.PacketConn, ro *xrecorder.HandlerRecorderObject, log logger.Logger) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // cancel all per-session goroutines on exit
+
 	bufferSize := h.md.udpBufferSize
 	if bufferSize <= 0 {
 		bufferSize = defaultBufferSize
 	}
 
-	b := bufpool.Get(bufferSize)
-	defer bufpool.Put(b)
-
+	b := make([]byte, bufferSize)
 	for {
 		n, addr, err := src.ReadFrom(b)
 		if err != nil {
 			return err
 		}
 
-		clientAddr, err := netip.ParseAddrPort(addr.String())
-		if err != nil {
-			return err
-		}
-		session, payload, err := h.udpServer.Inbound(b[:n], clientAddr)
-		if err != nil {
-			return err
+		ctxAddr, ok := addr.(interface {
+			Session() core.UDPSession
+			ClientAddr() net.Addr
+			TargetAddr() net.Addr
+		})
+		if !ok {
+			return fmt.Errorf("ss: missing udp session context for addr %v", addr)
 		}
 
-		targetAddr, err := net.ResolveUDPAddr("udp", session.Target().String())
-		if ro.Host == "" {
+		targetAddr := ctxAddr.TargetAddr()
+		if ro.Host == "" && targetAddr != nil {
 			ro.Host = targetAddr.String()
 		}
 
-		if h.options.Bypass != nil && h.options.Bypass.Contains(ctx, targetAddr.Network(), targetAddr.String(), bypass.WithService(h.options.Service)) {
-			log.Warn("bypass: ", addr)
+		if h.options.Bypass != nil && targetAddr != nil && h.options.Bypass.Contains(ctx, "udp", targetAddr.String(), bypass.WithService(h.options.Service)) {
+			log.Warn("bypass: ", targetAddr)
 			return nil
 		}
+
+		if targetAddr == nil {
+			return errors.New("ss: target address not available")
+		}
+
+		session := ctxAddr.Session()
+		if session == nil {
+			return fmt.Errorf("ss: udp session not found for addr %v", addr)
+		}
+
+		dstConn, err := h.packetConnForSession(ctx, src, session, ro, log)
 		if err != nil {
 			return err
 		}
 
-		dstConn, ok := h.connMap.Load(session.Hash())
-		if !ok {
-			// obtain a udp connection
-			var buf bytes.Buffer
-			c, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), "udp", "") // UDP association
-			ro.Route = buf.String()
-			if err != nil {
-				log.Error(err)
-				return err
-			}
-
-			cc, ok := c.(net.PacketConn)
-			if !ok {
-				err := errors.New("ss: wrong connection type")
-				log.Error(err)
-				return err
-			}
-			h.connMap.Store(session.Hash(), c)
-
-			dstConn = cc
-
-			log.Infof("%s <-> %s", src.LocalAddr(), cc.LocalAddr())
-
-			go func() {
-				defer func() {
-					c.Close()
-					h.connMap.Delete(session.Hash())
-				}()
-
-				for {
-					n, raddr, err := dstConn.(net.PacketConn).ReadFrom(b)
-					if err != nil {
-						log.Warnf("failed to read response: %v", err)
-						return
-					}
-
-					clientAddr := session.ClientAddr()
-					if h.options.Bypass != nil && h.options.Bypass.Contains(ctx, raddr.Network(), raddr.String(), bypass.WithService(h.options.Service)) {
-						log.Warn("bypass: ", raddr)
-						return
-					}
-					encrypted, err := h.udpServer.Outbound(b[:n], session)
-					if _, err = src.WriteTo(encrypted, net.UDPAddrFromAddrPort(clientAddr)); err != nil {
-						log.Warnf("failed to write response to %v: %v", clientAddr, err)
-						return
-					}
-
-					log.Tracef("%s <<< %s data: %d",
-						dstConn.(net.PacketConn).LocalAddr(), raddr, n)
-				}
-			}()
-		}
-
-		if n, err = dstConn.(net.PacketConn).WriteTo(payload, targetAddr); err != nil {
+		if _, err = dstConn.WriteTo(b[:n], targetAddr); err != nil {
 			return err
 		}
 
-		log.Tracef("%s >>> %s data: %d",
-			dstConn.(net.PacketConn).LocalAddr(), targetAddr, n)
+		log.Tracef("%s >>> %s data: %d", dstConn.LocalAddr(), targetAddr, n)
 	}
+}
+
+func (h *ssuHandler) packetConnForSession(ctx context.Context, src net.PacketConn, session core.UDPSession, ro *xrecorder.HandlerRecorderObject, log logger.Logger) (net.PacketConn, error) {
+	if cc, ok := h.connMap.Load(session.Hash()); ok {
+		return cc.(net.PacketConn), nil
+	}
+
+	var buf bytes.Buffer
+	c, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), "udp", "")
+	ro.Route = buf.String()
+	if err != nil {
+		log.Error(err)
+		return nil, err
+	}
+
+	cc, ok := c.(net.PacketConn)
+	if !ok {
+		c.Close()
+		err := errors.New("ss: wrong connection type")
+		log.Error(err)
+		return nil, err
+	}
+
+	if actual, loaded := h.connMap.LoadOrStore(session.Hash(), cc); loaded {
+		c.Close()
+		return actual.(net.PacketConn), nil
+	}
+
+	// Create a per-session cancel so the goroutine can be cleaned up
+	// when relayPacketUDP exits (parent context cancelled) or on error.
+	sessionCtx, sessionCancel := context.WithCancel(ctx)
+	h.cancels.Store(session.Hash(), sessionCancel)
+
+	go func() {
+		defer func() {
+			sessionCancel()
+			cc.Close()
+			h.connMap.Delete(session.Hash())
+			h.cancels.Delete(session.Hash())
+		}()
+
+		bufSize := h.md.udpBufferSize
+		if bufSize <= 0 {
+			bufSize = defaultBufferSize
+		}
+		b := make([]byte, bufSize)
+
+		for {
+			// Use a read deadline so the goroutine periodically checks
+			// whether the parent context has been cancelled, instead of
+			// blocking indefinitely on ReadFrom.
+			cc.SetReadDeadline(time.Now().Add(30 * time.Second))
+			n, raddr, err := cc.ReadFrom(b)
+			if err != nil {
+				// If the parent context is done, exit silently.
+				if sessionCtx.Err() != nil {
+					return
+				}
+				// Timeout is expected — check context again before retrying.
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				log.Warnf("failed to read response: %v", err)
+				return
+			}
+
+			if h.options.Bypass != nil && h.options.Bypass.Contains(sessionCtx, "udp", raddr.String(), bypass.WithService(h.options.Service)) {
+				log.Warn("bypass: ", raddr)
+				return
+			}
+
+			if sessionCtx.Err() != nil {
+				return
+			}
+			addr := core.NewUDPServerPacketAddr(raddr, net.UDPAddrFromAddrPort(session.ClientAddr()), session)
+			if _, err = src.WriteTo(b[:n], addr); err != nil {
+				log.Warnf("failed to write response to %v: %v", session.ClientAddr(), err)
+				return
+			}
+
+			log.Tracef("%s <<< %s data: %d", cc.LocalAddr(), raddr, n)
+		}
+	}()
+
+	return cc, nil
 }
 
 func (h *ssuHandler) checkRateLimit(addr net.Addr) bool {
@@ -343,4 +342,21 @@ func (h *ssuHandler) checkRateLimit(addr net.Addr) bool {
 	}
 
 	return true
+}
+
+// Close cancels all per-session goroutines and closes cached connections.
+func (h *ssuHandler) Close() error {
+	h.cancels.Range(func(key, value any) bool {
+		if cancel, ok := value.(context.CancelFunc); ok {
+			cancel()
+		}
+		return true
+	})
+	h.connMap.Range(func(key, value any) bool {
+		if cc, ok := value.(net.PacketConn); ok {
+			cc.Close()
+		}
+		return true
+	})
+	return nil
 }

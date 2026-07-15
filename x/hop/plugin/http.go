@@ -115,3 +115,13 @@ func (p *httpPlugin) Select(ctx context.Context, opts ...hop.SelectOption) *chai
 	}
 	return node
 }
+
+func (p *httpPlugin) Close() error {
+	if p.client == nil {
+		return nil
+	}
+	if tr := plugin.HTTPClientTransport(p.client); tr != nil {
+		tr.CloseIdleConnections()
+	}
+	return nil
+}

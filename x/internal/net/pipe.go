@@ -14,110 +14,166 @@ const (
 	tcpWaitTimeout = 10 * time.Second
 )
 
-// Pipe 在两个连接之间建立双向数据通道。
-//
-// 该函数面向长生命周期的代理/隧道场景（如 relay+bptls 承载 WireGuard UDP），
-// 因此不再对每次读取强制设置短超时。空闲连接的检测交由上层协议
-// （BusyPipe 的 idleTimeoutMs、PING/PONG）或系统 TCP keepalive 负责。
-//
-// 退出条件：
-//   - 任意方向产生非 EOF 错误。
-//   - 任意方向自然返回 EOF（半关闭后另一方向继续，直到自身也结束）。
-//   - 调用方 ctx 被取消（此时会主动关闭两端读端，唤醒阻塞的 Read）。
-func Pipe(ctx context.Context, rw1, rw2 io.ReadWriteCloser) error {
+// PipeOption configures the behaviour of Pipe.
+type PipeOption func(*pipeOptions)
+
+type pipeOptions struct {
+	readTimeout time.Duration
+}
+
+// WithReadTimeout sets an idle read timeout on each pipe half. When a read
+// blocks for longer than d the connection is closed. A value of 0 disables
+// the timeout entirely, relying on TCP keepalives or context cancellation to
+// detect dead connections.
+func WithReadTimeout(d time.Duration) PipeOption {
+	return func(o *pipeOptions) {
+		o.readTimeout = d
+	}
+}
+
+// Pipe establishes a bidirectional data channel between two connections.
+// Data read from rw1 is written to rw2, and data read from rw2 is written to
+// rw1. Each direction runs in its own goroutine. Pipe returns the first
+// non-EOF error encountered, or nil if both directions complete cleanly.
+// When ctx is cancelled, both connections are forcefully closed.
+func Pipe(ctx context.Context, rw1, rw2 io.ReadWriteCloser, opts ...PipeOption) error {
+	var options pipeOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// 监听 ctx 取消事件，强制关闭两端读端以唤醒阻塞的 Read；
-	// 退出时通过 stop 通道结束 watcher，避免 goroutine 泄漏。
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			closeRead(rw1)
-			closeRead(rw2)
-		case <-stop:
-		}
-	}()
-
 	errCh := make(chan error, 2)
+
+	// 启动两个方向的传输
 	go func() {
-		errCh <- pipeHalf(rw1, rw2)
-	}()
-	go func() {
-		errCh <- pipeHalf(rw2, rw1)
+		errCh <- pipeHalf(ctx, rw1, rw2, options.readTimeout)
 	}()
 
+	go func() {
+		errCh <- pipeHalf(ctx, rw2, rw1, options.readTimeout)
+	}()
+
+	// 等待第一个错误或完成
 	var firstErr error
-	for i := 0; i < 2; i++ {
-		err := <-errCh
-		if firstErr == nil && err != nil {
-			firstErr = err
+	completed := 0
+	for completed < 2 {
+		select {
+		case err := <-errCh:
+			completed++
+			if firstErr == nil && err != nil {
+				firstErr = err
+			}
+		case <-ctx.Done():
+			forceClose(rw1, rw2)
+			for completed < 2 {
+				if err := <-errCh; firstErr == nil && err != nil {
+					firstErr = err
+				}
+				completed++
+			}
+			if firstErr != nil {
+				return firstErr
+			}
+			return ctx.Err()
 		}
-		// 任一方向结束后取消 ctx，唤醒 watcher 关闭另一端读端，
-		// 避免单向流量正常退出后另一方向永远阻塞。
-		cancel()
 	}
 
 	return firstErr
 }
 
-// pipeHalf 单向管道传输：阻塞读、阻塞写，直到 src 自然结束或被外部关闭。
-// 不再周期性设置 read deadline，避免长连接被误断。
-func pipeHalf(src, dst io.ReadWriteCloser) error {
-	defer halfClose(src, dst)
+// pipeHalf 单向管道传输
+func pipeHalf(ctx context.Context, src, dst io.ReadWriteCloser, readTimeout time.Duration) error {
+	defer func() {
+		// 传输完成后执行TCP半关闭
+		halfClose(src, dst)
+	}()
 
 	buf := bufpool.Get(bufferSize / 2)
 	defer bufpool.Put(buf)
 
+	// 创建带超时的读取器
+	reader := &readDeadliner{
+		Reader: src,
+		ctx:    ctx,
+	}
+
+	// 循环读取并写入，每次读取都有超时
 	for {
-		nr, err := src.Read(buf)
-		if nr > 0 {
-			if _, werr := dst.Write(buf[:nr]); werr != nil {
-				return werr
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			// 设置读取超时 (仅当配置了超时时)
+			if readTimeout > 0 {
+				if rd, ok := src.(interface{ SetReadDeadline(time.Time) error }); ok {
+					rd.SetReadDeadline(time.Now().Add(readTimeout))
+				}
 			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				return nil
+
+			// 读取数据
+			nr, err := reader.Read(buf)
+			if err != nil {
+				if err != io.EOF {
+					return err
+				}
+				return nil // 正常结束
 			}
-			return err
+
+			// 写入数据
+			_, err = dst.Write(buf[:nr])
+			if err != nil {
+				return err
+			}
 		}
 	}
 }
 
-// closeRead 半关闭读端；若不支持半关闭，则整体关闭。
-// 用于在 ctx 取消时唤醒阻塞在 Read 上的 pipeHalf。
-func closeRead(rw io.ReadWriteCloser) {
-	if rw == nil {
-		return
-	}
-	if cr, ok := rw.(xio.CloseRead); ok {
-		if err := cr.CloseRead(); err != xio.ErrUnsupported {
-			return
-		}
-	}
-	_ = rw.Close()
+// readDeadliner 包装读取器，支持上下文取消
+type readDeadliner struct {
+	io.Reader
+	ctx context.Context
 }
 
-// halfClose 执行 TCP 半关闭：关闭 src 的读端，半关闭 dst 的写端；
-// 不支持半关闭时整体关闭 dst，并为半关闭后的 dst 设置回收超时。
+func (r *readDeadliner) Read(p []byte) (int, error) {
+	// 检查上下文是否已取消
+	select {
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	default:
+	}
+	return r.Reader.Read(p)
+}
+
+// halfClose 执行TCP半关闭
 func halfClose(src, dst io.ReadWriteCloser) {
+	// 关闭读取端
 	if cr, ok := src.(xio.CloseRead); ok {
-		_ = cr.CloseRead()
+		cr.CloseRead()
 	}
 
+	// 关闭写入端，尝试半关闭
 	if cw, ok := dst.(xio.CloseWrite); ok {
 		if err := cw.CloseWrite(); err == xio.ErrUnsupported {
-			_ = dst.Close()
-			return
+			dst.Close() // 不支持半关闭，完全关闭
+		} else {
+			// 设置半关闭超时
+			if rd, ok := dst.(interface{ SetReadDeadline(time.Time) error }); ok {
+				rd.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
+			}
 		}
-		// 给对端一个有限时间排空，避免半关闭后永久挂起。
-		if rd, ok := dst.(interface{ SetReadDeadline(time.Time) error }); ok {
-			_ = rd.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
-		}
-		return
+	} else {
+		dst.Close() // 不支持CloseWrite，完全关闭
 	}
-	_ = dst.Close()
+}
+
+// forceClose 强制关闭两个连接
+func forceClose(conns ...io.ReadWriteCloser) {
+	for _, conn := range conns {
+		if conn != nil {
+			conn.Close()
+		}
+	}
 }

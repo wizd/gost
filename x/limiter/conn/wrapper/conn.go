@@ -1,9 +1,12 @@
+// Package wrapper provides net.Conn and net.Listener wrappers that enforce
+// connection limits.
 package wrapper
 
 import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"syscall"
 
 	limiter "github.com/go-gost/core/limiter/conn"
@@ -19,8 +22,12 @@ var (
 type serverConn struct {
 	net.Conn
 	limiter limiter.Limiter
+	closed  atomic.Bool // release the limiter slot once, even if Close is called more than once
 }
 
+// WrapConn wraps a net.Conn with a connection limiter. On Close, the
+// limiter's Allow(-1) is called to decrement the current count. If limiter
+// is nil, the original connection is returned unchanged.
 func WrapConn(limiter limiter.Limiter, c net.Conn) net.Conn {
 	if limiter == nil {
 		return c
@@ -29,6 +36,12 @@ func WrapConn(limiter limiter.Limiter, c net.Conn) net.Conn {
 		Conn:    c,
 		limiter: limiter,
 	}
+}
+
+// UnwrapConn returns the underlying connection, allowing type assertions
+// through wrapper layers.
+func (c *serverConn) UnwrapConn() net.Conn {
+	return c.Conn
 }
 
 func (c *serverConn) SyscallConn() (rc syscall.RawConn, err error) {
@@ -41,7 +54,9 @@ func (c *serverConn) SyscallConn() (rc syscall.RawConn, err error) {
 }
 
 func (c *serverConn) Close() error {
-	c.limiter.Allow(-1)
+	if c.closed.CompareAndSwap(false, true) {
+		c.limiter.Allow(-1)
+	}
 	return c.Conn.Close()
 }
 
@@ -63,5 +78,5 @@ func (c *serverConn) Context() context.Context {
 	if innerCtx, ok := c.Conn.(ctx.Context); ok {
 		return innerCtx.Context()
 	}
-	return nil
+	return context.Background()
 }

@@ -14,7 +14,6 @@ import (
 	icmp_pkg "github.com/go-gost/x/internal/util/icmp"
 	"github.com/go-gost/x/registry"
 	"github.com/quic-go/quic-go"
-	"golang.org/x/net/icmp"
 )
 
 func init() {
@@ -76,9 +75,12 @@ func (d *icmpDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 	}
 
 	d.sessionMutex.Lock()
-	defer d.sessionMutex.Unlock()
 
 	session, ok := d.sessions[addr]
+	if session != nil && session.IsClosed() {
+		delete(d.sessions, addr) // session is dead
+		ok = false
+	}
 	if !ok {
 		options := &dialer.DialOptions{}
 		for _, opt := range opts {
@@ -87,11 +89,12 @@ func (d *icmpDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 
 		var pc net.PacketConn
 		if d.ip6 {
-			pc, err = icmp.ListenPacket("ip6:ipv6-icmp", "")
+			pc, err = icmp_pkg.ListenPacket("ip6:ipv6-icmp", "")
 		} else {
-			pc, err = icmp.ListenPacket("ip4:icmp", "")
+			pc, err = icmp_pkg.ListenPacket("ip4:icmp", "")
 		}
 		if err != nil {
+			d.sessionMutex.Unlock()
 			return
 		}
 
@@ -106,16 +109,22 @@ func (d *icmpDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 		if err != nil {
 			d.logger.Error(err)
 			pc.Close()
+			d.sessionMutex.Unlock()
 			return nil, err
 		}
 
 		d.sessions[addr] = session
 	}
+	d.sessionMutex.Unlock()
 
 	conn, err = session.GetConn()
 	if err != nil {
+		d.sessionMutex.Lock()
+		if d.sessions[addr] == session {
+			delete(d.sessions, addr)
+		}
 		session.Close()
-		delete(d.sessions, addr)
+		d.sessionMutex.Unlock()
 		return nil, err
 	}
 
@@ -134,7 +143,10 @@ func (d *icmpDialer) initSession(ctx context.Context, addr net.Addr, conn net.Pa
 	}
 
 	tlsCfg := d.options.TLSConfig
-	tlsCfg.NextProtos = []string{"h3", "quic/v1"}
+	tlsCfg = tlsCfg.Clone()
+	if len(tlsCfg.NextProtos) == 0 {
+		tlsCfg.NextProtos = []string{"h3", "quic/v1"}
+	}
 
 	session, err := quic.DialEarly(ctx, conn, addr, tlsCfg, quicConfig)
 	if err != nil {

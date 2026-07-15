@@ -1,8 +1,13 @@
+// Package hop provides a hop (node group) implementation that selects a node
+// from a group of proxy nodes using load-balancing strategies, filters, and
+// bypass rules. It supports periodic reloading of node lists from file, Redis,
+// or HTTP sources.
 package hop
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"sort"
@@ -34,54 +39,66 @@ type options struct {
 	logger      logger.Logger
 }
 
+// Option configures a hop.
 type Option func(*options)
 
+// NameOption sets the hop name.
 func NameOption(name string) Option {
 	return func(o *options) {
 		o.name = name
 	}
 }
 
+// NodeOption sets the initial node list for the hop.
 func NodeOption(nodes ...*chain.Node) Option {
 	return func(o *options) {
 		o.nodes = nodes
 	}
 }
+
+// BypassOption sets a hop-level bypass that can skip the entire hop.
 func BypassOption(bp bypass.Bypass) Option {
 	return func(o *options) {
 		o.bypass = bp
 	}
 }
 
+// SelectorOption sets the load-balancing strategy for node selection.
 func SelectorOption(s selector.Selector[*chain.Node]) Option {
 	return func(o *options) {
 		o.selector = s
 	}
 }
 
+// ReloadPeriodOption sets the interval for periodic reloading of node lists.
 func ReloadPeriodOption(period time.Duration) Option {
 	return func(opts *options) {
 		opts.period = period
 	}
 }
 
+// FileLoaderOption sets a loader that reads node configs from a file source.
 func FileLoaderOption(fileLoader loader.Loader) Option {
 	return func(opts *options) {
 		opts.fileLoader = fileLoader
 	}
 }
 
+// RedisLoaderOption sets a loader that reads node configs from a Redis source.
 func RedisLoaderOption(redisLoader loader.Loader) Option {
 	return func(opts *options) {
 		opts.redisLoader = redisLoader
 	}
 }
 
+// HTTPLoaderOption sets a loader that reads node configs from an HTTP source.
 func HTTPLoaderOption(httpLoader loader.Loader) Option {
 	return func(opts *options) {
 		opts.httpLoader = httpLoader
 	}
 }
+
+// LoggerOption sets the logger for the hop.
 func LoggerOption(logger logger.Logger) Option {
 	return func(opts *options) {
 		opts.logger = logger
@@ -96,6 +113,7 @@ type chainHop struct {
 	cancelFunc context.CancelFunc
 }
 
+// NewHop creates a new hop with the given options and starts periodic reloading.
 func NewHop(opts ...Option) hop.Hop {
 	var options options
 	for _, opt := range opts {
@@ -130,6 +148,26 @@ func (p *chainHop) Nodes() []*chain.Node {
 	return p.nodes
 }
 
+// Select chooses a node from the hop group for the given request context.
+//
+// Selection pipeline:
+//
+//  1. Hop-level bypass         — entire hop skipped if bypass matches (addr/host)
+//  2. Per-node filter (pool)   — each candidate must pass at least one gate:
+//       a. routing.Matcher     — boolean expression (Host/Protocol/Method/Path/
+//                                  Query/Header/Body). Match → non-zero Priority.
+//       b. isEligible fallback — when no Matcher set, checks node Options.Filter:
+//                                  checkHost(Host), checkProtocol(Protocol),
+//                                  checkPath(Path prefix).
+//     Nodes that fail all gates or hit a node-level bypass are excluded.
+//  3. Priority short-circuit   — if the top node has strictly higher Priority
+//                                (>0) than the rest and no backup flag is present,
+//                                it wins directly (selector skipped).
+//  4. Selector                 — Filters (FailFilter, BackupFilter) cull the pool,
+//                                then Strategy (roundRobin/random/fifo/hash/parallel)
+//                                picks one.
+//
+// Returns nil when no node survives all stages.
 func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.Node {
 	var options hop.SelectOptions
 	for _, opt := range opts {
@@ -138,12 +176,13 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 
 	log := p.logger
 
-	// hop level bypass
+	// Stage 1: hop-level bypass.
 	if p.options.bypass != nil &&
-		p.options.bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOpton(options.Host)) {
+		p.options.bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOption(options.Host)) {
 		return nil
 	}
 
+	// Stage 2: build candidate pool — each node must pass one of two gates.
 	var nodes []*chain.Node
 	for _, node := range p.Nodes() {
 		if node == nil {
@@ -151,25 +190,30 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		}
 		// node level bypass
 		if node.Options().Bypass != nil &&
-			node.Options().Bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOpton(options.Host)) {
+			node.Options().Bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOption(options.Host)) {
 			continue
 		}
 
 		if matcher := node.Options().Matcher; matcher != nil {
+			// Gate 2a: routing.Matcher — boolean expression on HTTP-level fields.
+			// A match assigns a non-zero Priority (from rule specificity).
 			req := routing.Request{
 				ClientIP: options.ClientIP,
+				Network:  options.Network,
 				Host:     options.Host,
 				Protocol: options.Protocol,
 				Method:   options.Method,
 				Path:     options.Path,
 				Query:    options.Query,
 				Header:   options.Header,
+				Body:     options.Body,
 			}
 			if !matcher.Match(&req) {
 				continue
 			}
 			log.Debugf("node %s match request %s %s, priority %d", node.Name, req.Protocol, req.Host, node.Options().Priority)
 		} else {
+			// Gate 2b: fallback eligibility — simple host/protocol/path filters.
 			if !p.isEligible(node, &options) {
 				continue
 			}
@@ -184,14 +228,29 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		return nodes[0]
 	}
 
+	// Stage 3: priority short-circuit.
+	// Sort descending so the highest priority node is at index 0.
 	sort.Slice(nodes, func(i, j int) bool {
 		return nodes[i].Options().Priority > nodes[j].Options().Priority
 	})
 
-	if nodes[0].Options().Priority > 0 {
+	if nodes[0].Options().Priority > 0 &&
+		!anyBackupNode(nodes) &&
+		nodes[0].Options().Priority > nodes[1].Options().Priority {
+		// Priority short-circuit: highest-priority non-backup node wins.
+		// Conditions: (1) top priority > 0 means a matcher indicated routing
+		// specificity, so the top node is authoritative for this request;
+		// (2) no backup node is present, otherwise BackupFilter would be
+		// silently bypassed; (3) the top priority is strictly higher than
+		// the second-highest — when multiple nodes share the same matcher
+		// rule they have equal priority and the selector (FailFilter,
+		// BackupFilter, strategy) should still apply for load balancing.
+		// When all three hold the selector is skipped and the best node wins directly.
+		p.logger.Debugf("priority shortcut: node %s selected", nodes[0].Name)
 		return nodes[0]
 	}
 
+	// Stage 4: selector — filters then strategy.
 	if s := p.options.selector; s != nil {
 		return s.Select(ctx, nodes...)
 	}
@@ -308,20 +367,31 @@ func (p *chainHop) reload(ctx context.Context) (err error) {
 }
 
 func (p *chainHop) load(ctx context.Context) (nodes []*chain.Node, err error) {
+	var errs []error
+
 	if loader := p.options.fileLoader; loader != nil {
 		r, er := loader.Load(ctx)
 		if er != nil {
 			p.logger.Warnf("file loader: %v", er)
+			errs = append(errs, er)
 		}
-		nodes, _ = p.parseNode(r)
+		ns, pe := p.parseNode(r)
+		if pe != nil {
+			errs = append(errs, pe)
+		}
+		nodes = append(nodes, ns...)
 	}
 
 	if loader := p.options.redisLoader; loader != nil {
 		r, er := loader.Load(ctx)
 		if er != nil {
 			p.logger.Warnf("redis loader: %v", er)
+			errs = append(errs, er)
 		}
-		ns, _ := p.parseNode(r)
+		ns, pe := p.parseNode(r)
+		if pe != nil {
+			errs = append(errs, pe)
+		}
 		nodes = append(nodes, ns...)
 	}
 
@@ -329,13 +399,16 @@ func (p *chainHop) load(ctx context.Context) (nodes []*chain.Node, err error) {
 		r, er := loader.Load(ctx)
 		if er != nil {
 			p.logger.Warnf("http loader: %v", er)
+			errs = append(errs, er)
 		}
-		if ns, _ := p.parseNode(r); ns != nil {
-			nodes = append(nodes, ns...)
+		ns, pe := p.parseNode(r)
+		if pe != nil {
+			errs = append(errs, pe)
 		}
+		nodes = append(nodes, ns...)
 	}
 
-	return
+	return nodes, errors.Join(errs...)
 }
 
 func (p *chainHop) parseNode(r io.Reader) ([]*chain.Node, error) {
@@ -348,7 +421,10 @@ func (p *chainHop) parseNode(r io.Reader) ([]*chain.Node, error) {
 		return nil, err
 	}
 
-	var nodes []*chain.Node
+	var (
+		nodes []*chain.Node
+		errs  []error
+	)
 	for _, nc := range ncs {
 		if nc == nil {
 			continue
@@ -356,11 +432,13 @@ func (p *chainHop) parseNode(r io.Reader) ([]*chain.Node, error) {
 
 		node, err := node_parser.ParseNode(p.options.name, nc, logger.Default())
 		if err != nil {
-			return nodes, err
+			p.logger.Warnf("skip node %s: %v", nc.Name, err)
+			errs = append(errs, err)
+			continue
 		}
 		nodes = append(nodes, node)
 	}
-	return nodes, nil
+	return nodes, errors.Join(errs...)
 }
 
 func (p *chainHop) Close() error {
@@ -371,5 +449,26 @@ func (p *chainHop) Close() error {
 	if p.options.redisLoader != nil {
 		p.options.redisLoader.Close()
 	}
+	if p.options.httpLoader != nil {
+		p.options.httpLoader.Close()
+	}
 	return nil
+}
+
+// anyBackupNode reports whether any node in the list has the backup metadata
+// flag set. Used to ensure that when backup nodes are in the candidate pool
+// the priority short-circuit is disabled, forcing selection through the
+// selector where BackupFilter can separate primary from failover nodes.
+// Without this gate, nodes with equal non-zero priority (auto-assigned from
+// matcher rule length) would skip BackupFilter entirely via the priority
+// short-circuit at Select, making backup metadata a no-op.
+func anyBackupNode(nodes []*chain.Node) bool {
+	for _, node := range nodes {
+		if md := node.Options().Metadata; md != nil && md.IsExists("backup") {
+			if md.Get("backup") == true {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -11,6 +11,12 @@ import (
 	ctxvalue "github.com/go-gost/x/ctx"
 )
 
+// Resolve resolves addr to a concrete IP address. If hosts is non-nil, it is
+// consulted first. If r is non-nil and no host mapping matched, the resolver
+// is used. If neither is available, the address is returned unchanged so that
+// the original hostname is preserved for downstream connectors (e.g., SOCKS5
+// ATYP=domain). DNS resolution is deferred to the final TCP dialer, which uses
+// a pure-Go resolver to avoid cgo thread exhaustion.
 func Resolve(ctx context.Context, network, addr string, r resolver.Resolver, hosts hosts.HostMapper, log logger.Logger) (string, error) {
 	if addr == "" {
 		return addr, nil
@@ -48,5 +54,10 @@ func Resolve(ctx context.Context, network, addr string, r resolver.Resolver, hos
 		}
 		return net.JoinHostPort(ips[0].String(), port), nil
 	}
+
+	// Return the address unchanged so that the original hostname is
+	// preserved through the proxy chain. DNS resolution happens in the
+	// final TCP dialer (dialer.go) which uses net.Resolver{PreferGo: true}
+	// to avoid cgo-based lookups that block OS threads.
 	return addr, nil
 }

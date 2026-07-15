@@ -10,11 +10,19 @@ import (
 )
 
 const (
-	defaultTimeout    = 5 * time.Second
-	defaultBufferSize = 1024
+	// defaultTimeout is the fallback timeout for DNS exchanges.
+	defaultTimeout = 5 * time.Second
+	// defaultBufferSize is the fallback buffer size for DNS message I/O.
+	defaultBufferSize = 4096
 )
 
+// metadata holds parsed DNS handler configuration.
 type metadata struct {
+	// readTimeout is the deadline for reading DNS query and writing DNS
+	// response on the client connection. Each DNS exchange (one query +
+	// one response) must complete within this window.
+	// Default: 0 (no timeout set by handler — DNS upstream timeout is
+	// controlled separately by the "timeout" field).
 	readTimeout time.Duration
 	ttl         time.Duration
 	timeout     time.Duration

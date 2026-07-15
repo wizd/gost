@@ -9,6 +9,7 @@ import (
 	"github.com/go-gost/core/dialer"
 	md "github.com/go-gost/core/metadata"
 	xctx "github.com/go-gost/x/ctx"
+	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/net/proxyproto"
 	ssh_util "github.com/go-gost/x/internal/util/ssh"
 	"github.com/go-gost/x/registry"
@@ -70,6 +71,14 @@ func (d *sshDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOp
 		if err != nil {
 			return
 		}
+		if d.md.tcpKeepalive {
+			xnet.ApplyKeepalive(conn, net.KeepAliveConfig{
+				Enable:   true,
+				Idle:     d.md.tcpKeepaliveIdle,
+				Interval: d.md.tcpKeepaliveInterval,
+				Count:    d.md.tcpKeepaliveCount,
+			})
+		}
 		if d.md.handshakeTimeout > 0 {
 			conn.SetDeadline(time.Now().Add(d.md.handshakeTimeout))
 			defer conn.SetDeadline(time.Time{})
@@ -96,6 +105,13 @@ func (d *sshDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOp
 	}
 	channel, reqs, err := session.OpenChannel(ssh_util.GostSSHTunnelRequest)
 	if err != nil {
+		// The cached session is unusable (typically dead but not yet detected
+		// by IsClosed, e.g. an idle connection silently dropped by NAT). Tear
+		// it down and evict it so the next Dial rebuilds a fresh session
+		// instead of retrying against this dead one. Matches the eviction
+		// pattern in the kcp/quic/icmp dialers.
+		session.Close()
+		delete(d.sessions, addr)
 		return nil, err
 	}
 	go ssh.DiscardRequests(reqs)

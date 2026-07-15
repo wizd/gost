@@ -2,9 +2,11 @@ package ss
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
-	"sync"
+	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/go-gost/core/connector"
@@ -15,6 +17,7 @@ import (
 	ctxvalue "github.com/go-gost/x/ctx"
 	"github.com/go-gost/x/internal/util/relay"
 	"github.com/go-gost/x/internal/util/ss"
+	ssnone "github.com/go-gost/x/internal/util/ss/none"
 	"github.com/go-gost/x/registry"
 )
 
@@ -23,11 +26,10 @@ func init() {
 }
 
 type ssuConnector struct {
-	client     core.UDPClient
-	tcpClient  core.TCPClient
-	md         metadata
-	options    connector.Options
-	sessionMap sync.Map
+	clientCfg core.ClientConfig
+	tcpClient core.TCPClient
+	md        metadata
+	options   connector.Options
 }
 
 func NewConnector(opts ...connector.Option) connector.Connector {
@@ -46,16 +48,27 @@ func (c *ssuConnector) Init(md md.Metadata) (err error) {
 		return
 	}
 
-	if c.options.Auth != nil {
-		method := c.options.Auth.Username()
-		password, _ := c.options.Auth.Password()
-		clientConfig, err := utils.NewClientConfig(method, password)
-		if err != nil {
-			return err
-		}
-		c.client = core.NewUDPClient(clientConfig, 60)
-		c.tcpClient = core.NewTCPClient(clientConfig)
+	if c.options.Auth == nil {
+		return errors.New("ss: auth is required")
 	}
+
+	method := c.options.Auth.Username()
+	password, _ := c.options.Auth.Password()
+
+	if strings.EqualFold(method, "none") || strings.EqualFold(method, "dummy") {
+		c.clientCfg = core.ClientConfig{Cipher: ssnone.Cipher, UDPTimeout: time.Minute}
+		c.tcpClient = core.NewTCPClient(core.ClientConfig{Cipher: ssnone.Cipher})
+		return
+	}
+
+	clientConfig, err := utils.NewClientConfig(method, password)
+	if err != nil {
+		return err
+	}
+	clientConfig.UDPTimeout = time.Minute
+
+	c.clientCfg = clientConfig
+	c.tcpClient = core.NewTCPClient(clientConfig)
 
 	return
 }
@@ -87,15 +100,25 @@ func (c *ssuConnector) Connect(ctx context.Context, conn net.Conn, network, addr
 	if taddr == nil {
 		taddr = &net.UDPAddr{}
 	}
+	serverAddr, err := netip.ParseAddrPort(conn.RemoteAddr().String())
+	if err != nil {
+		return nil, fmt.Errorf("ss: parse remote addr %q: %w", conn.RemoteAddr().String(), err)
+	}
+	clientCfg := c.clientCfg
+	clientCfg.ServerAddr = serverAddr
+	client := core.NewUDPClient(clientCfg)
+	if err := client.Init(); err != nil {
+		return nil, err
+	}
 
 	pc, ok := conn.(net.PacketConn)
 	if ok {
 		// standard UDP relay
-		return ss.UDPClientConn(pc, conn.RemoteAddr(), taddr, c.md.udpBufferSize, &c.client, &c.sessionMap), nil
+		return ss.UDPClientConn(pc, taddr, &client), nil
 	}
 
 	target := socks.ParseAddr(taddr.String())
-	conn, err := c.tcpClient.WrapConn(conn, target)
+	conn, err = c.tcpClient.WrapConn(conn, target)
 	if err != nil {
 		return nil, err
 	}

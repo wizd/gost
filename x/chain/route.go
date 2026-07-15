@@ -19,14 +19,18 @@ import (
 )
 
 var (
+	// ErrEmptyRoute is returned when the configured chain produces a route
+	// with no nodes.
 	ErrEmptyRoute = errors.New("empty route")
 )
 
 var (
+	// DefaultRoute is a fallback route that dials the target directly
+	// without going through any proxy nodes.
 	DefaultRoute chain.Route = &defaultRoute{}
 )
 
-// defaultRoute is a Route without nodes.
+// defaultRoute dials the target directly without any proxy nodes.
 type defaultRoute struct{}
 
 func (*defaultRoute) Dial(ctx context.Context, network, address string, opts ...chain.DialOption) (net.Conn, error) {
@@ -82,6 +86,12 @@ func (*defaultRoute) Bind(ctx context.Context, network, address string, opts ...
 			Logger:         logger,
 		})
 		return ln, err
+	case "unix":
+		addr, err := net.ResolveUnixAddr(network, address)
+		if err != nil {
+			return nil, err
+		}
+		return net.ListenUnix(network, addr)
 	default:
 		err := fmt.Errorf("network %s unsupported", network)
 		return nil, err
@@ -98,6 +108,8 @@ type RouteOptions struct {
 
 type RouteOption func(*RouteOptions)
 
+// ChainRouteOption sets the parent chain on a route, enabling error
+// tracking and metrics for the chain.
 func ChainRouteOption(c chain.Chainer) RouteOption {
 	return func(o *RouteOptions) {
 		o.Chain = c
@@ -109,6 +121,7 @@ type chainRoute struct {
 	options RouteOptions
 }
 
+// NewRoute creates a new route with the given options.
 func NewRoute(opts ...RouteOption) *chainRoute {
 	var options RouteOptions
 	for _, opt := range opts {
@@ -271,20 +284,29 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 		}
 		cc, err = preNode.Options().Transport.Connect(ctx, cn, "tcp", addr)
 		if err != nil {
+			if cc != nil {
+				cc.Close()
+			}
 			cn.Close()
 			if marker != nil {
 				marker.Mark()
 			}
 			return
 		}
-		cc, err = node.Options().Transport.Handshake(ctx, cc)
+		var cc2 net.Conn
+		cc2, err = node.Options().Transport.Handshake(ctx, cc)
 		if err != nil {
+			if cc2 != nil {
+				cc2.Close()
+			}
+			cc.Close()
 			cn.Close()
 			if marker != nil {
 				marker.Mark()
 			}
 			return
 		}
+		cc = cc2
 		if marker != nil {
 			marker.Reset()
 		}

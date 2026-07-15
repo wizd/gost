@@ -13,6 +13,32 @@ import (
 	xnet "github.com/go-gost/x/internal/net"
 )
 
+// handleConnect handles a CmdConnect request.
+//
+// This is the "pull" path: a public user's connection arrives via the tunnel
+// handler's listener, and the handler creates a stream into the tunnel to
+// reach the internal service.
+//
+// Flow:
+//  1. Bypass check against dstAddr.
+//  2. Ingress routing: if the tunnel is the public entryPointID, look up the
+//     destination host in the ingress table to find the target tunnel ID.
+//     For direct tunnels, the tunnelID from the request is used directly.
+//  3. Dialer.Dial() → pool.Get() → GetConn() → mux.OpenStream()
+//     (or SD fallback if no local connector).
+//  4. Relay protocol framing:
+//     a. Local node (node == h.id): write StatusOK response to the public
+//        connection, then write a StatusOK response with src/dst address
+//        features to the mux stream. The internal client uses these address
+//        features to know where to connect.
+//     b. Remote node (SD fallback): write the original relay request
+//        directly to the mux stream for the remote node to process.
+//  5. Pipe(publicConn, muxStream) — bidirectional data relay until either
+//     side closes.
+//
+// The mux stream (cc) is closed via defer cc.Close() when this function
+// returns. The public connection (conn) is closed by the caller's
+// defer conn.Close() in Handle().
 func (h *tunnelHandler) handleConnect(ctx context.Context, req *relay.Request, conn net.Conn, network, srcAddr string, dstAddr string, tunnelID relay.TunnelID, log logger.Logger) error {
 	log = log.WithFields(map[string]any{
 		"dst":    fmt.Sprintf("%s/%s", dstAddr, network),
@@ -30,7 +56,7 @@ func (h *tunnelHandler) handleConnect(ctx context.Context, req *relay.Request, c
 		log.Debug("bypass: ", dstAddr)
 		resp.Status = relay.StatusForbidden
 		_, err := resp.WriteTo(conn)
-		return err
+		return fmt.Errorf("bypass blocked %s: %w", dstAddr, err)
 	}
 
 	host, _, _ := net.SplitHostPort(dstAddr)
@@ -38,7 +64,7 @@ func (h *tunnelHandler) handleConnect(ctx context.Context, req *relay.Request, c
 	var tid relay.TunnelID
 	if ing := h.md.ingress; ing != nil && host != "" {
 		if rule := ing.GetRule(ctx, host, ingress.WithService(h.options.Service)); rule != nil {
-			tid = parseTunnelID(rule.Endpoint)
+			tid = ParseTunnelID(rule.Endpoint)
 		}
 	}
 
@@ -74,12 +100,12 @@ func (h *tunnelHandler) handleConnect(ctx context.Context, req *relay.Request, c
 	}
 
 	d := Dialer{
-		node:    h.id,
-		pool:    h.pool,
-		sd:      h.md.sd,
-		retry:   3,
-		timeout: 15 * time.Second,
-		log:     log,
+		Node:    h.id,
+		Pool:    h.pool,
+		SD:      h.md.sd,
+		Retry:   3,
+		Timeout: 15 * time.Second,
+		Log:     log,
 	}
 	cc, node, cid, err := d.Dial(ctx, network, tid.String())
 	if err != nil {
@@ -111,9 +137,17 @@ func (h *tunnelHandler) handleConnect(ctx context.Context, req *relay.Request, c
 		af.ParseFrom(dstAddr)
 		resp.Features = append(resp.Features, af) // dst address
 
-		resp.WriteTo(cc)
+		if _, err := resp.WriteTo(cc); err != nil {
+			log.Error(err)
+			cc.Close()
+			return err
+		}
 	} else {
-		req.WriteTo(cc)
+		if _, err := req.WriteTo(cc); err != nil {
+			log.Error(err)
+			cc.Close()
+			return err
+		}
 	}
 
 	t := time.Now()

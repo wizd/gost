@@ -24,34 +24,72 @@ import (
 	"github.com/go-gost/x/routing"
 )
 
+// MaxMatcherBodySize bounds the request body prefix (in bytes) exposed to
+// body matchers via routing.Request.Body. It protects against unbounded
+// buffering when a node opts in to body matching.
+const MaxMatcherBodySize = 1 << 20 // 1MB
+
+// ParseNode converts a NodeConfig into a *chain.Node. It resolves the
+// connector and dialer from their registries, applies TLS settings, extracts
+// metadata-driven options (so_mark, interface, netns, proxy protocol), sets up
+// bypass rules, node filters, HTTP settings, and TLS node settings. The hop
+// parameter is used only for logging context.
+
+func parseBodyRewrites(vs []config.HTTPBodyRewriteConfig, log logger.Logger) []chain.HTTPBodyRewriteSettings {
+	var out []chain.HTTPBodyRewriteSettings
+	for _, v := range vs {
+		pattern, _ := regexp.Compile(v.Match)
+		rw := chain.HTTPBodyRewriteSettings{
+			Type:         v.Type,
+			Pattern:      pattern,
+			Replacement:  []byte(v.Replacement),
+			MaxChunkSize: v.MaxChunkSize,
+		}
+		if v.Rewriter != "" {
+			if !registry.RewriterRegistry().IsRegistered(v.Rewriter) {
+				log.Warnf("rewriter %q not found in registry for rewrite rule", v.Rewriter)
+			}
+			rw.Rewriter = registry.RewriterRegistry().Get(v.Rewriter)
+		}
+		if pattern != nil || rw.Rewriter != nil {
+			out = append(out, rw)
+		}
+	}
+	return out
+}
+
 func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.Node, error) {
 	if cfg == nil {
 		return nil, nil
 	}
 
-	if cfg.Connector == nil {
-		cfg.Connector = &config.ConnectorConfig{
-			Type: "http",
-		}
+	connCfg := cfg.Connector
+	if connCfg == nil {
+		connCfg = &config.ConnectorConfig{}
+	}
+	if connCfg.Type == "" {
+		connCfg.Type = "http"
 	}
 
-	if cfg.Dialer == nil {
-		cfg.Dialer = &config.DialerConfig{
-			Type: "tcp",
-		}
+	dialCfg := cfg.Dialer
+	if dialCfg == nil {
+		dialCfg = &config.DialerConfig{}
+	}
+	if dialCfg.Type == "" {
+		dialCfg.Type = "tcp"
 	}
 
 	nodeLogger := log.WithFields(map[string]any{
 		"hop":       hop,
 		"kind":      "node",
 		"node":      cfg.Name,
-		"connector": cfg.Connector.Type,
-		"dialer":    cfg.Dialer.Type,
+		"connector": connCfg.Type,
+		"dialer":    dialCfg.Type,
 	})
 
 	serverName, _, _ := net.SplitHostPort(cfg.Addr)
 
-	tlsCfg := cfg.Connector.TLS
+	tlsCfg := connCfg.TLS
 	if tlsCfg == nil {
 		tlsCfg = &config.TLSConfig{}
 	}
@@ -68,25 +106,22 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		"kind": "connector",
 	})
 	var cr connector.Connector
-	if rf := registry.ConnectorRegistry().Get(cfg.Connector.Type); rf != nil {
+	if rf := registry.ConnectorRegistry().Get(connCfg.Type); rf != nil {
 		cr = rf(
-			connector.AuthOption(auth_parser.Info(cfg.Connector.Auth)),
+			connector.AuthOption(auth_parser.Info(connCfg.Auth)),
 			connector.TLSConfigOption(tlsConfig),
 			connector.LoggerOption(connectorLogger),
 		)
 	} else {
-		return nil, fmt.Errorf("unregistered connector: %s", cfg.Connector.Type)
+		return nil, fmt.Errorf("unregistered connector: %s", connCfg.Type)
 	}
 
-	if cfg.Connector.Metadata == nil {
-		cfg.Connector.Metadata = make(map[string]any)
-	}
-	if err := cr.Init(mdx.NewMetadata(cfg.Connector.Metadata)); err != nil {
+	if err := cr.Init(mdx.NewMetadata(connCfg.Metadata)); err != nil {
 		connectorLogger.Error("init: ", err)
 		return nil, err
 	}
 
-	tlsCfg = cfg.Dialer.TLS
+	tlsCfg = dialCfg.TLS
 	if tlsCfg == nil {
 		tlsCfg = &config.TLSConfig{}
 	}
@@ -106,21 +141,18 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 	})
 
 	var d dialer.Dialer
-	if rf := registry.DialerRegistry().Get(cfg.Dialer.Type); rf != nil {
+	if rf := registry.DialerRegistry().Get(dialCfg.Type); rf != nil {
 		d = rf(
-			dialer.AuthOption(auth_parser.Info(cfg.Dialer.Auth)),
+			dialer.AuthOption(auth_parser.Info(dialCfg.Auth)),
 			dialer.TLSConfigOption(tlsConfig),
 			dialer.LoggerOption(dialerLogger),
 			dialer.ProxyProtocolOption(mdutil.GetInt(md, parsing.MDKeyProxyProtocol)),
 		)
 	} else {
-		return nil, fmt.Errorf("unregistered dialer: %s", cfg.Dialer.Type)
+		return nil, fmt.Errorf("unregistered dialer: %s", dialCfg.Type)
 	}
 
-	if cfg.Dialer.Metadata == nil {
-		cfg.Dialer.Metadata = make(map[string]any)
-	}
-	if err := d.Init(mdx.NewMetadata(cfg.Dialer.Metadata)); err != nil {
+	if err := d.Init(mdx.NewMetadata(dialCfg.Metadata)); err != nil {
 		dialerLogger.Error("init: ", err)
 		return nil, err
 	}
@@ -142,7 +174,7 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 	opts := []chain.NodeOption{
 		chain.TransportNodeOption(tr),
 		chain.BypassNodeOption(xbypass.BypassGroup(bypass_parser.List(cfg.Bypass, cfg.Bypasses...)...)),
-		chain.ResoloverNodeOption(registry.ResolverRegistry().Get(cfg.Resolver)),
+		chain.ResolverNodeOption(registry.ResolverRegistry().Get(cfg.Resolver)),
 		chain.HostMapperNodeOption(registry.HostsRegistry().Get(cfg.Hosts)),
 		chain.MetadataNodeOption(md),
 		chain.NetworkNodeOption(cfg.Network),
@@ -173,6 +205,10 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		if rule := strings.TrimSpace(cfg.Matcher.Rule); rule != "" {
 			if matcher, err := routing.NewMatcher(rule); err == nil {
 				log.Debugf("new matcher for node %s with rule %s", cfg.Name, cfg.Matcher.Rule)
+				// Priority 0 means "use default": automatically set to the
+				// rule length so longer (more specific) rules outrank shorter
+				// ones. Use a negative priority to opt out of this behavior
+				// and always go through the selector.
 				if priority == 0 {
 					priority = len(cfg.Matcher.Rule)
 				}
@@ -181,6 +217,13 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 				log.Error(err)
 				priority = -1
 			}
+		}
+
+		if bodySize := cfg.Matcher.BodySize; bodySize > 0 {
+			if bodySize > MaxMatcherBodySize {
+				bodySize = MaxMatcherBodySize
+			}
+			opts = append(opts, chain.MatcherBodySizeNodeOption(bodySize))
 		}
 
 		opts = append(opts, chain.PriorityNodeOption(priority))
@@ -219,15 +262,9 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 				})
 			}
 		}
-		for _, v := range cfg.HTTP.RewriteBody {
-			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
-				settings.RewriteResponseBody = append(settings.RewriteResponseBody, chain.HTTPBodyRewriteSettings{
-					Type:        v.Type,
-					Pattern:     pattern,
-					Replacement: []byte(v.Replacement),
-				})
-			}
-		}
+		settings.RewriteResponseBody = append(settings.RewriteResponseBody, parseBodyRewrites(cfg.HTTP.RewriteBody, log)...)
+		settings.RewriteResponseBody = append(settings.RewriteResponseBody, parseBodyRewrites(cfg.HTTP.RewriteResponseBody, log)...)
+		settings.RewriteRequestBody = append(settings.RewriteRequestBody, parseBodyRewrites(cfg.HTTP.RewriteRequestBody, log)...)
 		opts = append(opts, chain.HTTPNodeOption(settings))
 	}
 

@@ -11,6 +11,7 @@ import (
 	"github.com/go-gost/core/handler"
 	"github.com/go-gost/core/hop"
 	"github.com/go-gost/core/listener"
+	"github.com/go-gost/core/rewriter"
 	"github.com/go-gost/core/logger"
 	"github.com/go-gost/core/observer/stats"
 	"github.com/go-gost/core/recorder"
@@ -29,15 +30,39 @@ import (
 	logger_parser "github.com/go-gost/x/config/parsing/logger"
 	selector_parser "github.com/go-gost/x/config/parsing/selector"
 	tls_util "github.com/go-gost/x/internal/util/tls"
+	quota_wrapper "github.com/go-gost/x/limiter/quota/wrapper"
 	cache_limiter "github.com/go-gost/x/limiter/traffic/cache"
 	"github.com/go-gost/x/metadata"
 	mdutil "github.com/go-gost/x/metadata/util"
 	xstats "github.com/go-gost/x/observer/stats"
+	xrecorder "github.com/go-gost/x/recorder"
 	"github.com/go-gost/x/registry"
 	xservice "github.com/go-gost/x/service"
 	"github.com/vishvananda/netns"
 )
 
+// plaintextListeners are listener types that never terminate TLS on their
+// accepted connections, so any certFile/keyFile/caFile configured for them is
+// silently ignored. This catches the common footgun where a user writes e.g.
+// `tls+mws://...?certFile=...` expecting TLS: the "tls+" prefix is parsed as
+// the handler scheme (see x/config/cmd/cmd.go buildServiceConfig), not a TLS
+// wrapper, so the underlying mws listener stays plaintext. Extend this set when
+// new plaintext listeners are added.
+var plaintextListeners = map[string]bool{
+	"tcp": true, "udp": true,
+	"ws": true, "mws": true,
+	"redirect": true, "tproxy": true,
+	"rtcp": true, "rudp": true,
+	"unix": true, "runix": true, "serial": true, "stdio": true,
+}
+
+// ParseService constructs a fully-wired service.Service from a ServiceConfig.
+// It defaults the listener to "tcp" and the handler to "auto", resolves named
+// components from the registry (authers, admissions, bypasses, resolvers,
+// hosts, chains, hops, limiters, recorders, observers), composes TLS settings,
+// and applies metadata-driven options (proxy protocol, netns, sockopts,
+// pre/post hooks, stats, etc.). It returns an error if the listener or handler
+// type is unknown or if construction of any sub-component fails.
 func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 	if cfg.Listener == nil {
 		cfg.Listener = &config.ListenerConfig{}
@@ -77,6 +102,12 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 	if tlsConfig == nil {
 		tlsConfig = parsing.DefaultTLSConfig().Clone()
 		tls_util.SetTLSOptions(tlsConfig, tlsCfg.Options)
+		tls_util.RejectUnknownSNIConfig(tlsConfig, tlsCfg.RejectUnknownSNI, tlsCfg.ServerNames)
+	}
+
+	if (tlsCfg.CertFile != "" || tlsCfg.KeyFile != "" || tlsCfg.CAFile != "") && plaintextListeners[cfg.Listener.Type] {
+		serviceLogger.Warnf("TLS certificate options are configured but the %q listener does not use TLS and will ignore them; the connection will be plaintext. Use a TLS-capable listener (e.g. mwss, wss, tls, quic, grpc, http2, http3) to enable TLS.",
+			cfg.Listener.Type)
 	}
 
 	authers := auth_parser.List(cfg.Listener.Auther, cfg.Listener.Authers...)
@@ -107,6 +138,7 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 	var observerPeriod time.Duration
 	var netnsIn, netnsOut string
 	var dialTimeout time.Duration
+	var labels map[string]string
 
 	var limiterRefreshInterval time.Duration
 	var limiterCleanupInterval time.Duration
@@ -142,6 +174,14 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		limiterRefreshInterval = mdutil.GetDuration(md, parsing.MDKeyLimiterRefreshInterval)
 		limiterCleanupInterval = mdutil.GetDuration(md, parsing.MDKeyLimiterCleanupInterval)
 		limiterScope = mdutil.GetString(md, parsing.MDKeyLimiterScope)
+
+		labels = mdutil.GetStringMapString(md, parsing.MDKeyLabels)
+	}
+
+	if len(labels) > 0 {
+		serviceLogger = serviceLogger.WithFields(map[string]any{
+			"labels": labels,
+		})
 	}
 
 	listenerLogger := serviceLogger.WithFields(map[string]any{
@@ -229,6 +269,10 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		return nil, err
 	}
 
+	for _, qname := range cfg.Quotas {
+		ln = quota_wrapper.WrapListener(ln, strings.TrimSpace(qname))
+	}
+
 	handlerLogger := serviceLogger.WithFields(map[string]any{
 		"kind": "handler",
 	})
@@ -245,6 +289,7 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 	if tlsConfig == nil {
 		tlsConfig = parsing.DefaultTLSConfig().Clone()
 		tls_util.SetTLSOptions(tlsConfig, tlsCfg.Options)
+		tls_util.RejectUnknownSNIConfig(tlsConfig, tlsCfg.RejectUnknownSNI, tlsCfg.ServerNames)
 	}
 
 	authers = auth_parser.List(cfg.Handler.Auther, cfg.Handler.Authers...)
@@ -259,11 +304,44 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		auther = xauth.AuthenticatorGroup(authers...)
 	}
 
+	// Parse skipauth from handler metadata to whitelist client IPs that
+	// should bypass authentication. Accepts both YAML arrays
+	// (skipauth: ["10.0.0.0/8"]) and comma-separated URL query values
+	// (?skipauth=10.0.0.0/8,192.168.1.1).
+	if cfg.Handler.Metadata != nil {
+		hmd := metadata.NewMetadata(cfg.Handler.Metadata)
+		skipauth := mdutil.GetStrings(hmd, "skipauth")
+		if len(skipauth) == 0 {
+			if s := mdutil.GetString(hmd, "skipauth"); s != "" {
+				for _, p := range strings.Split(s, ",") {
+					if p = strings.TrimSpace(p); p != "" {
+						skipauth = append(skipauth, p)
+					}
+				}
+			}
+		}
+		if len(skipauth) > 0 {
+			if auther != nil {
+				auther = xauth.WhitelistedAuthenticator(auther, skipauth)
+				handlerLogger.Debugf("skipauth whitelist applied: %v", skipauth)
+			} else {
+				handlerLogger.Warnf("skipauth configured but no auther set — authentication is already disabled for all clients")
+			}
+		}
+	}
+
 	var recorders []recorder.RecorderObject
 	for _, r := range cfg.Recorders {
 		md := metadata.NewMetadata(r.Metadata)
+		rec := registry.RecorderRegistry().Get(r.Name)
+		if r.Metadata != nil {
+			rec = &xrecorder.MetadataRecorder{
+				Recorder: rec,
+				Metadata: r.Metadata,
+			}
+		}
 		recorders = append(recorders, recorder.RecorderObject{
-			Recorder: registry.RecorderRegistry().Get(r.Name),
+			Recorder: rec,
 			Record:   r.Record,
 			Options: &recorder.Options{
 				Direction:       mdutil.GetBool(md, parsing.MDKeyRecorderDirection),
@@ -272,7 +350,16 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 				HTTPBody:        mdutil.GetBool(md, parsing.MDKeyRecorderHTTPBody),
 				MaxBodySize:     mdutil.GetInt(md, parsing.MDKeyRecorderHTTPMaxBodySize),
 			},
+			Metadata: r.Metadata,
 		})
+	}
+
+	var rew rewriter.Rewriter
+	if cfg.Rewriter != "" {
+		if !registry.RewriterRegistry().IsRegistered(cfg.Rewriter) {
+			serviceLogger.Warnf("rewriter %q not found in registry", cfg.Rewriter)
+		}
+		rew = registry.RewriterRegistry().Get(cfg.Rewriter)
 	}
 
 	routerOpts = []chain.RouterOption{
@@ -304,6 +391,7 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 			handler.TrafficLimiterOption(registry.TrafficLimiterRegistry().Get(cfg.Handler.Limiter)),
 			handler.ObserverOption(registry.ObserverRegistry().Get(cfg.Handler.Observer)),
 			handler.RecordersOption(recorders...),
+			handler.RewriterOption(rew),
 			handler.LoggerOption(handlerLogger),
 			handler.ServiceOption(cfg.Name),
 			handler.NetnsOption(netnsIn),
@@ -340,6 +428,7 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		xservice.ObserverOption(registry.ObserverRegistry().Get(cfg.Observer)),
 		xservice.ObserverPeriodOption(observerPeriod),
 		xservice.LoggerOption(serviceLogger),
+		xservice.LabelsOption(labels),
 	)
 
 	serviceLogger.Infof("listening on %s/%s", s.Addr().String(), s.Addr().Network())

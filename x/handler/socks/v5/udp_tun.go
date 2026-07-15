@@ -17,6 +17,7 @@ import (
 	"github.com/go-gost/x/internal/net/udp"
 	"github.com/go-gost/x/internal/util/socks"
 	traffic_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
+	xstats "github.com/go-gost/x/observer/stats"
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
 	xrecorder "github.com/go-gost/x/recorder"
 )
@@ -107,6 +108,27 @@ func (h *socks5Handler) handleUDPTun(ctx context.Context, conn net.Conn, network
 
 	}
 	defer pc.Close()
+
+	// If the upstream is a raw *net.UDPConn (direct dial or BIND mode),
+	// wrap it so domainAddr from socks.UDPTunServerConn.ReadFrom are
+	// resolved through the configured resolver instead of failing WriteTo.
+	if _, ok := pc.(*net.UDPConn); ok {
+		pc = &resolvePacketConn{
+			PacketConn:  pc,
+			resolver:    h.options.Router.Options().Resolver,
+			hostMapper:  h.options.Router.Options().HostMapper,
+		}
+	}
+
+	{
+		pStats := xstats.Stats{}
+		pc = stats_wrapper.WrapPacketConn(pc, &pStats)
+
+		defer func() {
+			ro.InputBytes += pStats.Get(stats.KindInputBytes)
+			ro.OutputBytes += pStats.Get(stats.KindOutputBytes)
+		}()
+	}
 
 	log = log.WithFields(map[string]any{
 		"src":  pc.LocalAddr().String(),

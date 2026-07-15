@@ -48,6 +48,7 @@ import (
 	_ "github.com/go-gost/x/dialer/tls"
 	_ "github.com/go-gost/x/dialer/udp"
 	_ "github.com/go-gost/x/dialer/unix"
+	_ "github.com/go-gost/x/dialer/utls"
 	_ "github.com/go-gost/x/dialer/ws"
 
 	// Register handlers
@@ -104,7 +105,9 @@ import (
 	_ "github.com/go-gost/x/listener/redirect/udp"
 	_ "github.com/go-gost/x/listener/rtcp"
 	_ "github.com/go-gost/x/listener/rudp"
+	_ "github.com/go-gost/x/listener/runix"
 	_ "github.com/go-gost/x/listener/serial"
+	_ "github.com/go-gost/x/listener/stdio"
 	_ "github.com/go-gost/x/listener/ssh"
 	_ "github.com/go-gost/x/listener/sshd"
 	_ "github.com/go-gost/x/listener/tap"

@@ -4,6 +4,8 @@ import (
 	"sync/atomic"
 
 	"github.com/go-gost/core/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
 const (
@@ -30,18 +32,44 @@ const (
 )
 
 var (
-	defaultMetrics metrics.Metrics = NewMetrics()
-	enabled        atomic.Bool
+	defaultMetrics  metrics.Metrics
+	defaultRegistry *prometheus.Registry
+	enabled         atomic.Bool
 )
 
+func init() {
+	defaultRegistry = prometheus.NewRegistry()
+
+	// Register Go and process collectors on our custom registry so the metrics
+	// endpoint is self-contained. The process collector is platform-specific:
+	// Linux/Windows use the standard procfs/Win32-based collector; all other
+	// platforms (FreeBSD, Darwin, etc.) use a gopsutil-based collector.
+	defaultRegistry.MustRegister(collectors.NewGoCollector())
+	registerProcessCollector(defaultRegistry)
+
+	defaultMetrics = NewMetrics(defaultRegistry)
+}
+
+// Registry returns the custom Prometheus registry that holds all GOST metrics
+// plus the Go and process collectors. The metrics HTTP endpoint should serve
+// from this registry rather than prometheus.DefaultGatherer.
+func Registry() *prometheus.Registry {
+	return defaultRegistry
+}
+
+// Enable enables or disables metrics collection globally. When disabled, all
+// GetCounter, GetGauge, and GetObserver calls return noop implementations.
 func Enable(b bool) {
 	enabled.Store(b)
 }
 
+// IsEnabled reports whether metrics collection is enabled.
 func IsEnabled() bool {
 	return enabled.Load()
 }
 
+// GetCounter returns a Counter for the given name and labels. When metrics are
+// disabled, a noop implementation is returned.
 func GetCounter(name metrics.MetricName, labels metrics.Labels) metrics.Counter {
 	if IsEnabled() {
 		return defaultMetrics.Counter(name, labels)
@@ -49,6 +77,8 @@ func GetCounter(name metrics.MetricName, labels metrics.Labels) metrics.Counter 
 	return noop.Counter(name, labels)
 }
 
+// GetGauge returns a Gauge for the given name and labels. When metrics are
+// disabled, a noop implementation is returned.
 func GetGauge(name metrics.MetricName, labels metrics.Labels) metrics.Gauge {
 	if IsEnabled() {
 		return defaultMetrics.Gauge(name, labels)
@@ -56,6 +86,8 @@ func GetGauge(name metrics.MetricName, labels metrics.Labels) metrics.Gauge {
 	return noop.Gauge(name, labels)
 }
 
+// GetObserver returns an Observer for the given name and labels. When metrics are
+// disabled, a noop implementation is returned.
 func GetObserver(name metrics.MetricName, labels metrics.Labels) metrics.Observer {
 	if IsEnabled() {
 		return defaultMetrics.Observer(name, labels)

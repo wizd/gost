@@ -13,9 +13,19 @@ import (
 )
 
 type metadata struct {
+	// readTimeout is the deadline for the initial protocol sniffing phase
+	// (used by SnifferBuilder.ReadTimeout). After sniffing completes and
+	// raw forwarding begins, this timeout no longer applies.
+	// Default: 15s.
 	readTimeout   time.Duration
-	proxyProtocol int
+	// idleTimeout is the idle read timeout applied to each direction of
+	// the bidirectional pipe (xnet.Pipe). A value of 0 or negative disables
+	// the timeout entirely, relying on TCP keepalives and context
+	// cancellation to detect dead connections.
+	// Default: 0 (disabled).
+	idleTimeout   time.Duration
 	httpKeepalive bool
+	proxyProtocol int
 
 	sniffing                    bool
 	sniffingTimeout             time.Duration
@@ -33,14 +43,19 @@ func (h *forwardHandler) parseMetadata(md mdata.Metadata) (err error) {
 	if h.md.readTimeout <= 0 {
 		h.md.readTimeout = 15 * time.Second
 	}
+
+	h.md.idleTimeout = mdutil.GetDuration(md, "idleTimeout")
+	if h.md.idleTimeout < 0 {
+		h.md.idleTimeout = 0
+	}
+
+	h.md.httpKeepalive = mdutil.GetBool(md, "http.keepalive")
 	h.md.proxyProtocol = mdutil.GetInt(md, "proxyProtocol")
 
 	h.md.sniffing = mdutil.GetBool(md, "sniffing")
 	h.md.sniffingTimeout = mdutil.GetDuration(md, "sniffing.timeout")
 	h.md.sniffingWebsocket = mdutil.GetBool(md, "sniffing.websocket")
 	h.md.sniffingWebsocketSampleRate = mdutil.GetFloat(md, "sniffing.websocket.sampleRate")
-
-	h.md.httpKeepalive = mdutil.GetBool(md, "http.keepalive")
 
 	certFile := mdutil.GetString(md, "mitm.certFile", "mitm.caCertFile")
 	keyFile := mdutil.GetString(md, "mitm.keyFile", "mitm.caKeyFile")
@@ -57,5 +72,6 @@ func (h *forwardHandler) parseMetadata(md mdata.Metadata) (err error) {
 	}
 	h.md.alpn = mdutil.GetString(md, "mitm.alpn")
 	h.md.mitmBypass = registry.BypassRegistry().Get(mdutil.GetString(md, "mitm.bypass"))
+
 	return
 }

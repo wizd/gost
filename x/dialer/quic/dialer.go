@@ -58,9 +58,12 @@ func (d *quicDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 	}
 
 	d.sessionMutex.Lock()
-	defer d.sessionMutex.Unlock()
 
 	session, ok := d.sessions[addr]
+	if session != nil && session.IsClosed() {
+		delete(d.sessions, addr) // session is dead
+		ok = false
+	}
 	if !ok {
 		options := &dialer.DialOptions{}
 		for _, opt := range opts {
@@ -69,11 +72,13 @@ func (d *quicDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 
 		c, err := options.Dialer.Dial(ctx, "udp", "")
 		if err != nil {
+			d.sessionMutex.Unlock()
 			return nil, err
 		}
 		pc, ok := c.(net.PacketConn)
 		if !ok {
 			c.Close()
+			d.sessionMutex.Unlock()
 			return nil, errors.New("quic: wrong connection type")
 		}
 
@@ -85,16 +90,22 @@ func (d *quicDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 		if err != nil {
 			d.logger.Error(err)
 			pc.Close()
+			d.sessionMutex.Unlock()
 			return nil, err
 		}
 
 		d.sessions[addr] = session
 	}
+	d.sessionMutex.Unlock()
 
 	conn, err = session.GetConn()
 	if err != nil {
+		d.sessionMutex.Lock()
+		if d.sessions[addr] == session {
+			delete(d.sessions, addr)
+		}
 		session.Close()
-		delete(d.sessions, addr)
+		d.sessionMutex.Unlock()
 		return nil, err
 	}
 
@@ -115,7 +126,10 @@ func (d *quicDialer) initSession(ctx context.Context, addr net.Addr, conn net.Pa
 	}
 
 	tlsCfg := d.options.TLSConfig
-	tlsCfg.NextProtos = []string{"h3", "quic/v1"}
+	tlsCfg = tlsCfg.Clone()
+	if len(tlsCfg.NextProtos) == 0 {
+		tlsCfg.NextProtos = []string{"h3", "quic/v1"}
+	}
 
 	session, err := quic.DialEarly(ctx, conn, addr, tlsCfg, quicConfig)
 	if err != nil {

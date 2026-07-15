@@ -14,6 +14,12 @@ type serverConn struct {
 	ctx context.Context
 }
 
+// UnwrapConn returns the underlying connection, allowing type assertions
+// through wrapper layers.
+func (c *serverConn) UnwrapConn() net.Conn {
+	return c.Conn
+}
+
 func (c *serverConn) Context() context.Context {
 	return c.ctx
 }
@@ -56,6 +62,9 @@ func (c *serverConn) CloseWrite() error {
 	return xio.ErrUnsupported
 }
 
+// WrapClientConn writes a PROXY protocol header to c using src and dst
+// addresses, then returns c for continued use. If ppv is <= 0 or either
+// address is nil, the connection is returned unchanged.
 func WrapClientConn(ppv int, src, dst net.Addr, c net.Conn) net.Conn {
 	if ppv <= 0 || c == nil {
 		return c

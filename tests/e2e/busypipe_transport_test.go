@@ -17,7 +17,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 func TestRelayOverBusyPipe(t *testing.T) {
@@ -54,7 +53,7 @@ services:
 		SharedNetworkName,
 		serverCfg,
 		nil,
-		wait.ForLog("listening on").WithOccurrence(1),
+		"3307/tcp",
 	)
 	require.NoError(t, err)
 	defer serverC.Terminate(ctx)
@@ -94,7 +93,7 @@ chains:
 		SharedNetworkName,
 		clientCfg,
 		nil,
-		wait.ForLog("listening on").WithOccurrence(1),
+		"8080/tcp",
 	)
 	require.NoError(t, err)
 	defer clientC.Terminate(ctx)
@@ -151,7 +150,7 @@ services:
 			{HostFilePath: certPath, ContainerFilePath: "/tls/server.crt", FileMode: 0644},
 			{HostFilePath: keyPath, ContainerFilePath: "/tls/server.key", FileMode: 0600},
 		},
-		wait.ForLog("listening on").WithOccurrence(1),
+		"3317/tcp",
 	)
 	require.NoError(t, err)
 	defer serverC.Terminate(ctx)
@@ -193,7 +192,7 @@ chains:
 		SharedNetworkName,
 		clientCfg,
 		nil,
-		wait.ForLog("listening on").WithOccurrence(1),
+		"8080/tcp",
 	)
 	require.NoError(t, err)
 	defer clientC.Terminate(ctx)

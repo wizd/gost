@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"maps"
 	"os"
 
 	"github.com/go-gost/core/metrics"
@@ -14,7 +15,14 @@ type promMetrics struct {
 	histograms map[metrics.MetricName]*prometheus.HistogramVec
 }
 
-func NewMetrics() metrics.Metrics {
+// NewMetrics returns a Prometheus-based Metrics implementation. All metrics are
+// registered with the given registry. Use nil to register with the default
+// Prometheus registry.
+func NewMetrics(reg *prometheus.Registry) metrics.Metrics {
+	if reg == nil {
+		reg = prometheus.DefaultRegisterer.(*prometheus.Registry)
+	}
+
 	host, _ := os.Hostname()
 	m := &promMetrics{
 		host: host,
@@ -92,13 +100,13 @@ func NewMetrics() metrics.Metrics {
 		},
 	}
 	for k := range m.gauges {
-		prometheus.MustRegister(m.gauges[k])
+		reg.MustRegister(m.gauges[k])
 	}
 	for k := range m.counters {
-		prometheus.MustRegister(m.counters[k])
+		reg.MustRegister(m.counters[k])
 	}
 	for k := range m.histograms {
-		prometheus.MustRegister(m.histograms[k])
+		reg.MustRegister(m.histograms[k])
 	}
 
 	return m
@@ -107,35 +115,32 @@ func NewMetrics() metrics.Metrics {
 func (m *promMetrics) Gauge(name metrics.MetricName, labels metrics.Labels) metrics.Gauge {
 	v, ok := m.gauges[name]
 	if !ok {
-		return nil
+		return nopGauge
 	}
-	if labels == nil {
-		labels = metrics.Labels{}
-	}
-	labels["host"] = m.host
-	return v.With(prometheus.Labels(labels))
+	plabels := prometheus.Labels{}
+	maps.Copy(plabels, labels)
+	plabels["host"] = m.host
+	return v.With(plabels)
 }
 
 func (m *promMetrics) Counter(name metrics.MetricName, labels metrics.Labels) metrics.Counter {
 	v, ok := m.counters[name]
 	if !ok {
-		return nil
+		return nopCounter
 	}
-	if labels == nil {
-		labels = metrics.Labels{}
-	}
-	labels["host"] = m.host
-	return v.With(prometheus.Labels(labels))
+	plabels := prometheus.Labels{}
+	maps.Copy(plabels, labels)
+	plabels["host"] = m.host
+	return v.With(plabels)
 }
 
 func (m *promMetrics) Observer(name metrics.MetricName, labels metrics.Labels) metrics.Observer {
 	v, ok := m.histograms[name]
 	if !ok {
-		return nil
+		return nopObserver
 	}
-	if labels == nil {
-		labels = metrics.Labels{}
-	}
-	labels["host"] = m.host
-	return v.With(prometheus.Labels(labels))
+	plabels := prometheus.Labels{}
+	maps.Copy(plabels, labels)
+	plabels["host"] = m.host
+	return v.With(plabels)
 }

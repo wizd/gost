@@ -1,10 +1,18 @@
+// Package file provides a static file-serving handler for GOST.
+// It serves files from a configured directory over HTTP via the GOST proxy chain.
 package file
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +39,9 @@ type fileHandler struct {
 	recorder recorder.RecorderObject
 }
 
+// NewHandler creates a static file-serving handler. It registers as "file" in the
+// handler registry and serves files from the directory specified by the "file.dir"
+// or "dir" metadata key.
 func NewHandler(opts ...handler.Option) handler.Handler {
 	options := handler.Options{}
 	for _, opt := range opts {
@@ -47,7 +58,26 @@ func (h *fileHandler) Init(md md.Metadata) (err error) {
 		return
 	}
 
-	h.handler = http.FileServer(http.Dir(h.md.dir))
+	if h.md.dir != "" {
+		if info, err := os.Stat(h.md.dir); err != nil {
+			return fmt.Errorf("file handler: directory %q: %w", h.md.dir, err)
+		} else if !info.IsDir() {
+			return fmt.Errorf("file handler: %q is not a directory", h.md.dir)
+		}
+	}
+
+	fs := http.FileServer(http.Dir(h.md.dir))
+	h.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			if !h.md.put {
+				http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			h.handlePUT(w, r)
+			return
+		}
+		fs.ServeHTTP(w, r)
+	})
 	h.server = &http.Server{
 		Handler: http.HandlerFunc(h.handleFunc),
 	}
@@ -60,8 +90,9 @@ func (h *fileHandler) Init(md md.Metadata) (err error) {
 	}
 
 	h.ln = &singleConnListener{
-		conn: make(chan net.Conn),
+		conn: make(chan net.Conn, 1),
 		done: make(chan struct{}),
+		addr: &listenerAddr{},
 	}
 	go h.server.Serve(h.ln)
 
@@ -74,11 +105,14 @@ func (h *fileHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler
 		clientAddr = srcAddr.String()
 	}
 
+	remoteAddr := conn.RemoteAddr()
+	localAddr := conn.LocalAddr()
+
 	h.options.Logger.WithFields(map[string]any{
 		"client": clientAddr,
-		"remote": conn.RemoteAddr().String(),
-		"local":  conn.LocalAddr().String(),
-	}).Infof("%s - %s", conn.RemoteAddr(), conn.LocalAddr())
+		"remote": remoteAddr.String(),
+		"local":  localAddr.String(),
+	}).Infof("%s - %s", remoteAddr, localAddr)
 
 	h.ln.send(conn)
 
@@ -86,7 +120,55 @@ func (h *fileHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler
 }
 
 func (h *fileHandler) Close() error {
+	if h.ln != nil {
+		h.ln.Close()
+	}
 	return h.server.Close()
+}
+
+func (h *fileHandler) handlePUT(w http.ResponseWriter, r *http.Request) {
+	// Reject path traversal attempts.
+	target := path.Clean(r.URL.Path)
+	if strings.Contains(target, "..") || !strings.HasPrefix(target, "/") {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	dest := filepath.Join(h.md.dir, filepath.FromSlash(target))
+	// Verify the resolved path is within the base directory.
+	base, err := filepath.Abs(h.md.dir)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	absDest, err := filepath.Abs(dest)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !strings.HasPrefix(absDest, base) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(absDest), 0755); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	f, err := os.Create(absDest)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, r.Body); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
 }
 
 func (h *fileHandler) handleFunc(w http.ResponseWriter, r *http.Request) {
@@ -149,8 +231,15 @@ func (h *fileHandler) handleFunc(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.handler.ServeHTTP(rw, r)
+	if h.handler != nil {
+		h.handler.ServeHTTP(rw, r)
+	}
 }
+
+type listenerAddr struct{}
+
+func (a *listenerAddr) Network() string { return "file" }
+func (a *listenerAddr) String() string  { return "file" }
 
 type singleConnListener struct {
 	conn chan net.Conn
@@ -188,9 +277,15 @@ func (l *singleConnListener) Addr() net.Addr {
 
 func (l *singleConnListener) send(conn net.Conn) {
 	select {
+	case <-l.done:
+		conn.Close()
+		return
+	default:
+	}
+	select {
 	case l.conn <- conn:
 	case <-l.done:
-		return
+		conn.Close()
 	}
 }
 
@@ -209,4 +304,10 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 func (w *responseWriter) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
 	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+// Unwrap returns the underlying ResponseWriter, allowing http.ResponseController
+// to discover optional interfaces (Flusher, Hijacker, etc.) on the wrapped writer.
+func (w *responseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

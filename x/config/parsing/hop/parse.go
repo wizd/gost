@@ -21,6 +21,10 @@ import (
 	mdutil "github.com/go-gost/x/metadata/util"
 )
 
+// ParseHop converts a HopConfig into a hop.Hop. It resolves plugin backends
+// (HTTP or gRPC), parses inline nodes with metadata inheritance from the parent
+// hop, wires up a node selector, and configures optional file, Redis, and HTTP
+// hot-reload sources. Returns nil with no error when cfg is nil.
 func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 	if cfg == nil {
 		return nil, nil
@@ -38,6 +42,7 @@ func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 		case plugin.HTTP:
 			return hop_plugin.NewHTTPPlugin(
 				cfg.Name, cfg.Plugin.Addr,
+				plugin.TokenOption(cfg.Plugin.Token),
 				plugin.TLSConfigOption(tlsCfg),
 				plugin.TimeoutOption(cfg.Plugin.Timeout),
 			), nil
@@ -54,15 +59,17 @@ func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 	var soMark int
 	ifce := cfg.Interface
 	var netns string
+
+	if cfg.SockOpts != nil {
+		soMark = cfg.SockOpts.Mark
+	}
+
 	if cfg.Metadata != nil {
 		md := metadata.NewMetadata(cfg.Metadata)
 		if v := mdutil.GetString(md, parsing.MDKeyInterface); v != "" {
 			ifce = v
 		}
 
-		if cfg.SockOpts != nil {
-			soMark = cfg.SockOpts.Mark
-		}
 		if v := mdutil.GetInt(md, parsing.MDKeySoMark); v > 0 {
 			soMark = v
 		}
@@ -76,12 +83,13 @@ func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 			continue
 		}
 
-		m := v.Metadata
-		if m == nil {
-			m = map[string]any{}
-			v.Metadata = m
+		// Build a merged metadata map for inheritance without mutating
+		// the original node config.
+		merged := make(map[string]any)
+		for k, val := range v.Metadata {
+			merged[k] = val
 		}
-		md := metadata.NewMetadata(m)
+		md := metadata.NewMetadata(merged)
 
 		if v.Resolver == "" {
 			v.Resolver = cfg.Resolver
@@ -91,37 +99,30 @@ func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 		}
 
 		if !md.IsExists(parsing.MDKeyInterface) {
-			// inherit from hop
 			if ifce != "" {
-				m[parsing.MDKeyInterface] = ifce
+				merged[parsing.MDKeyInterface] = ifce
 			}
-			// node level
 			if v.Interface != "" {
-				m[parsing.MDKeyInterface] = v.Interface
+				merged[parsing.MDKeyInterface] = v.Interface
 			}
 		}
 		if !md.IsExists(parsing.MDKeySoMark) {
-			// inherit from hop
 			if soMark != 0 {
-				m[parsing.MDKeySoMark] = soMark
+				merged[parsing.MDKeySoMark] = soMark
 			}
-			// node level
 			if v.SockOpts != nil && v.SockOpts.Mark != 0 {
-				m[parsing.MDKeySoMark] = v.SockOpts.Mark
+				merged[parsing.MDKeySoMark] = v.SockOpts.Mark
 			}
 		}
 		if !md.IsExists(parsing.MDKeyProxyProtocol) && ppv > 0 {
-			// inherit from hop
-			m[parsing.MDKeyProxyProtocol] = ppv
+			merged[parsing.MDKeyProxyProtocol] = ppv
 		}
 		if !md.IsExists(parsing.MDKeyNetns) {
-			// inherit from hop
 			if netns != "" {
-				m[parsing.MDKeyNetns] = netns
+				merged[parsing.MDKeyNetns] = netns
 			}
-			// node level
 			if v.Netns != "" {
-				m[parsing.MDKeyNetns] = v.Name
+				merged[parsing.MDKeyNetns] = v.Netns
 			}
 		}
 
@@ -139,7 +140,11 @@ func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 			v.Dialer.Type = "tcp"
 		}
 
+		// Temporarily swap merged metadata so ParseNode sees inherited values.
+		origMeta := v.Metadata
+		v.Metadata = merged
 		node, err := node_parser.ParseNode(cfg.Name, v, log)
+		v.Metadata = origMeta
 		if err != nil {
 			return nil, err
 		}

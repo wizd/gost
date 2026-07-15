@@ -83,9 +83,11 @@ func (c *DatagramConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 		return 0, c.remoteAddr, nil
 	}
 
-	// Per RFC 9297: datagram format is context-id (varint) + payload
-	// For CONNECT-UDP with context ID 0, the first byte is 0x00
-	// We strip the context ID prefix
+	// Per RFC 9297: datagram format is context-id (varint) + payload.
+	// For CONNECT-UDP (RFC 9298), the context ID is always 0.
+	// QUIC varints encode 0 as a single byte 0x00.
+	// NOTE: Only context ID 0 is supported. Non-zero context IDs would
+	// require full QUIC varint decoding.
 	if data[0] == 0x00 {
 		data = data[1:]
 	}
@@ -103,7 +105,7 @@ func (c *DatagramConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	default:
 	}
 
-	// Prepend context ID (0x00 for context ID 0)
+	// Prepend context ID (0x00 for CONNECT-UDP context ID 0 per RFC 9298)
 	datagram := make([]byte, 1+len(b))
 	datagram[0] = 0x00 // Context ID = 0
 	copy(datagram[1:], b)
@@ -174,3 +176,105 @@ var (
 	_ net.Conn       = (*DatagramConn)(nil)
 	_ net.PacketConn = (*DatagramConn)(nil)
 )
+
+// StreamReadWriter is an interface for reading and writing to HTTP/3 streams.
+// Both http3.Stream and http3.RequestStream implement this interface.
+type StreamReadWriter interface {
+	io.Reader
+	io.Writer
+	io.Closer
+	SetDeadline(t time.Time) error
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+}
+
+// StreamConn wraps an HTTP/3 stream as net.Conn for TCP tunneling (RFC 9114).
+// Unlike DatagramConn which uses HTTP/3 datagrams, StreamConn reads/writes
+// directly to the HTTP/3 stream body for reliable, ordered byte streams.
+type StreamConn struct {
+	stream     StreamReadWriter
+	localAddr  net.Addr
+	remoteAddr net.Addr
+	closed     chan struct{}
+	closeOnce  sync.Once
+}
+
+// NewStreamConn creates a new StreamConn wrapping an HTTP/3 stream (server-side).
+// This is used for TCP CONNECT tunneling where data flows through the stream body.
+func NewStreamConn(stream *http3.Stream, laddr, raddr net.Addr) *StreamConn {
+	return &StreamConn{
+		stream:     stream,
+		localAddr:  laddr,
+		remoteAddr: raddr,
+		closed:     make(chan struct{}),
+	}
+}
+
+// NewStreamConnFromRequestStream creates a new StreamConn wrapping an HTTP/3 request stream (client-side).
+// This is used for TCP CONNECT tunneling where data flows through the stream body.
+func NewStreamConnFromRequestStream(stream *http3.RequestStream, laddr, raddr net.Addr) *StreamConn {
+	return &StreamConn{
+		stream:     stream,
+		localAddr:  laddr,
+		remoteAddr: raddr,
+		closed:     make(chan struct{}),
+	}
+}
+
+// Read reads data from the HTTP/3 stream body.
+func (c *StreamConn) Read(b []byte) (n int, err error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+	return c.stream.Read(b)
+}
+
+// Write writes data to the HTTP/3 stream body.
+func (c *StreamConn) Write(b []byte) (n int, err error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+	return c.stream.Write(b)
+}
+
+// Close closes the stream connection.
+func (c *StreamConn) Close() error {
+	var err error
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		err = c.stream.Close()
+	})
+	return err
+}
+
+// LocalAddr returns the local network address.
+func (c *StreamConn) LocalAddr() net.Addr {
+	return c.localAddr
+}
+
+// RemoteAddr returns the remote network address.
+func (c *StreamConn) RemoteAddr() net.Addr {
+	return c.remoteAddr
+}
+
+// SetDeadline sets the read and write deadlines.
+func (c *StreamConn) SetDeadline(t time.Time) error {
+	return c.stream.SetDeadline(t)
+}
+
+// SetReadDeadline sets the read deadline.
+func (c *StreamConn) SetReadDeadline(t time.Time) error {
+	return c.stream.SetReadDeadline(t)
+}
+
+// SetWriteDeadline sets the write deadline.
+func (c *StreamConn) SetWriteDeadline(t time.Time) error {
+	return c.stream.SetWriteDeadline(t)
+}
+
+// Ensure StreamConn implements net.Conn
+var _ net.Conn = (*StreamConn)(nil)

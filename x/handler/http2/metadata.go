@@ -20,12 +20,13 @@ type metadata struct {
 	authBasicRealm       string
 	observerPeriod       time.Duration
 	observerResetTraffic bool
+	idleTimeout time.Duration // idle read deadline per Pipe direction during forwarding; read from "readTimeout" or "read.timeout" metadata key. 0 = disabled.
 
 	limiterRefreshInterval time.Duration
 	limiterCleanupInterval time.Duration
 }
 
-func (h *http2Handler) parseMetadata(md mdata.Metadata) error {
+func (h *http2Handler) parseMetadata(md mdata.Metadata) {
 	if m := mdutil.GetStringMapString(md, "http.header", "header"); len(m) > 0 {
 		hd := http.Header{}
 		for k, v := range m {
@@ -55,14 +56,14 @@ func (h *http2Handler) parseMetadata(md mdata.Metadata) error {
 	}
 	h.md.observerResetTraffic = mdutil.GetBool(md, "observer.resetTraffic")
 
+	h.md.idleTimeout = mdutil.GetDuration(md, "readTimeout", "read.timeout")
+
 	h.md.limiterRefreshInterval = mdutil.GetDuration(md, "limiter.refreshInterval")
 	h.md.limiterCleanupInterval = mdutil.GetDuration(md, "limiter.cleanupInterval")
-
-	return nil
 }
 
 type probeResistance struct {
 	Type  string
 	Value string
-	Knock string
+	Knock string // optional comma-separated hostnames; probe resistance only fires when the request hostname matches none of them
 }

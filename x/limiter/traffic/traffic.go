@@ -1,3 +1,6 @@
+// Package traffic provides a traffic/bandwidth limiter implementation that
+// supports per-service, per-connection, per-IP, and per-CIDR rate limiting
+// for both ingress (In) and egress (Out) directions.
 package traffic
 
 import (
@@ -20,8 +23,10 @@ import (
 )
 
 const (
+	// ServiceLimitKey is the special key used for service-level rate limits.
 	ServiceLimitKey = "$"
-	ConnLimitKey    = "$$"
+	// ConnLimitKey is the special key used for connection-level rate limits.
+	ConnLimitKey = "$$"
 )
 
 const (
@@ -38,38 +43,48 @@ type options struct {
 	logger      logger.Logger
 }
 
+// Option configures a TrafficLimiter.
 type Option func(opts *options)
 
+// LimitsOption sets the static limit rules. Each string is a limit definition
+// in the format "<key> <in> [out]" where in/out are byte quantities with
+// optional SI/IEC suffixes (e.g., "100B", "1MB", "512KB").
 func LimitsOption(limits ...string) Option {
 	return func(opts *options) {
 		opts.limits = limits
 	}
 }
 
+// ReloadPeriodOption sets the period for reloading limit rules from external
+// loaders. A period of zero disables periodic reloading.
 func ReloadPeriodOption(period time.Duration) Option {
 	return func(opts *options) {
 		opts.period = period
 	}
 }
 
+// FileLoaderOption sets a file-based loader for limit rules.
 func FileLoaderOption(fileLoader loader.Loader) Option {
 	return func(opts *options) {
 		opts.fileLoader = fileLoader
 	}
 }
 
+// RedisLoaderOption sets a Redis-based loader for limit rules.
 func RedisLoaderOption(redisLoader loader.Loader) Option {
 	return func(opts *options) {
 		opts.redisLoader = redisLoader
 	}
 }
 
+// HTTPLoaderOption sets an HTTP-based loader for limit rules.
 func HTTPLoaderOption(httpLoader loader.Loader) Option {
 	return func(opts *options) {
 		opts.httpLoader = httpLoader
 	}
 }
 
+// LoggerOption sets the logger for the traffic limiter.
 func LoggerOption(logger logger.Logger) Option {
 	return func(opts *options) {
 		opts.logger = logger
@@ -77,8 +92,9 @@ func LoggerOption(logger logger.Logger) Option {
 }
 
 type limitValue struct {
-	in  int
-	out int
+	in    int
+	out   int
+	burst int
 }
 
 type trafficLimiter struct {
@@ -96,6 +112,9 @@ type trafficLimiter struct {
 	cancelFunc context.CancelFunc
 }
 
+// NewTrafficLimiter creates a new TrafficLimiter with the given options.
+// It starts a background goroutine for periodic reload of limit rules from
+// external loaders.
 func NewTrafficLimiter(opts ...Option) traffic.TrafficLimiter {
 	var options options
 	for _, opt := range opts {
@@ -166,12 +185,17 @@ func (l *trafficLimiter) In(ctx context.Context, key string, opts ...limiter.Opt
 		}
 	}
 
-	host, _, _ := net.SplitHostPort(key)
+	host, _, err := net.SplitHostPort(key)
+	if err != nil {
+		host = key
+	}
 	// IP level limiter
 	if lim, ok := l.inLimits.Get(host); ok {
 		// cached IP limiter
 		if lim != nil {
 			lims = append(lims, lim.(traffic.Limiter))
+			// reset expiration to prevent unbounded cache growth
+			l.inLimits.Set(host, lim, defaultExpiration)
 		}
 	} else {
 		l.mu.RLock()
@@ -183,14 +207,16 @@ func (l *trafficLimiter) In(ctx context.Context, key string, opts ...limiter.Opt
 			if v, _ := p[0].(*cidrLimitEntry); v != nil {
 				if lim := v.generator.In(); lim != nil {
 					lims = append(lims, lim)
-					l.inLimits.Set(host, lim, cache.NoExpiration)
+					l.inLimits.Set(host, lim, defaultExpiration)
 				}
 			}
 		}
 	}
 
 	var lim traffic.Limiter
-	if len(lims) > 0 {
+	if len(lims) == 1 {
+		lim = lims[0]
+	} else if len(lims) > 1 {
 		lim = newLimiterGroup(lims...)
 	}
 
@@ -245,12 +271,17 @@ func (l *trafficLimiter) Out(ctx context.Context, key string, opts ...limiter.Op
 		}
 	}
 
-	host, _, _ := net.SplitHostPort(key)
+	host, _, err := net.SplitHostPort(key)
+	if err != nil {
+		host = key
+	}
 	// IP level limiter
 	if lim, ok := l.outLimits.Get(host); ok {
 		if lim != nil {
 			// cached IP level limiter
 			lims = append(lims, lim.(traffic.Limiter))
+			// reset expiration to prevent unbounded cache growth
+			l.outLimits.Set(host, lim, defaultExpiration)
 		}
 	} else {
 		l.mu.RLock()
@@ -262,14 +293,16 @@ func (l *trafficLimiter) Out(ctx context.Context, key string, opts ...limiter.Op
 			if v, _ := p[0].(*cidrLimitEntry); v != nil {
 				if lim := v.generator.Out(); lim != nil {
 					lims = append(lims, lim)
-					l.outLimits.Set(host, lim, cache.NoExpiration)
+					l.outLimits.Set(host, lim, defaultExpiration)
 				}
 			}
 		}
 	}
 
 	var lim traffic.Limiter
-	if len(lims) > 0 {
+	if len(lims) == 1 {
+		lim = lims[0]
+	} else if len(lims) > 1 {
 		lim = newLimiterGroup(lims...)
 	}
 
@@ -327,7 +360,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 			}
 		} else {
 			if value.in > 0 {
-				l.inLimits.Set(ServiceLimitKey, NewLimiter(value.in), cache.NoExpiration)
+				l.inLimits.Set(ServiceLimitKey, NewLimiterWithBurst(value.in, value.burst), cache.NoExpiration)
 			}
 		}
 
@@ -340,7 +373,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 			}
 		} else {
 			if value.out > 0 {
-				l.outLimits.Set(ServiceLimitKey, NewLimiter(value.out), cache.NoExpiration)
+				l.outLimits.Set(ServiceLimitKey, NewLimiterWithBurst(value.out, value.burst), cache.NoExpiration)
 			}
 		}
 		delete(values, ServiceLimitKey)
@@ -354,7 +387,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 		if v, _ := l.generators.Load(ConnLimitKey); v != nil {
 			in, out = v.(*limitGenerator).in, v.(*limitGenerator).out
 		}
-		l.generators.Store(ConnLimitKey, newLimitGenerator(value.in, value.out))
+		l.generators.Store(ConnLimitKey, newLimitGenerator(value.in, value.out, value.burst))
 
 		if value.in <= 0 {
 			l.connInLimits.Flush()
@@ -362,7 +395,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 			if in != value.in {
 				for _, item := range l.connInLimits.Items() {
 					if v := item.Object; v != nil {
-						v.(traffic.Limiter).Set(in)
+						v.(traffic.Limiter).Set(value.in)
 					}
 				}
 			}
@@ -374,7 +407,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 			if out != value.out {
 				for _, item := range l.connOutLimits.Items() {
 					if v := item.Object; v != nil {
-						v.(traffic.Limiter).Set(out)
+						v.(traffic.Limiter).Set(value.out)
 					}
 				}
 			}
@@ -396,7 +429,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 			if _, ipNet, _ := net.ParseCIDR(key); ipNet != nil {
 				cidrGenerators.Insert(&cidrLimitEntry{
 					ipNet:     *ipNet,
-					generator: newLimitGenerator(value.in, value.out),
+					generator: newLimitGenerator(value.in, value.out, value.burst),
 				})
 				continue
 			}
@@ -411,7 +444,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 				delete(inLimits, key)
 			} else {
 				if value.in > 0 {
-					l.inLimits.Set(key, NewLimiter(value.in), cache.NoExpiration)
+					l.inLimits.Set(key, NewLimiterWithBurst(value.in, value.burst), defaultExpiration)
 				}
 			}
 
@@ -425,7 +458,7 @@ func (l *trafficLimiter) reload(ctx context.Context) error {
 				delete(outLimits, key)
 			} else {
 				if value.out > 0 {
-					l.outLimits.Set(key, NewLimiter(value.out), cache.NoExpiration)
+					l.outLimits.Set(key, NewLimiterWithBurst(value.out, value.burst), defaultExpiration)
 				}
 			}
 		}
@@ -480,11 +513,11 @@ func (l *trafficLimiter) load(ctx context.Context) (values map[string]limitValue
 	values = make(map[string]limitValue)
 
 	for _, v := range l.options.limits {
-		key, in, out := l.parseLimit(v)
+		key, in, out, burst := l.parseLimit(v)
 		if key == "" {
 			continue
 		}
-		values[key] = limitValue{in: in, out: out}
+		values[key] = limitValue{in: in, out: out, burst: burst}
 	}
 
 	if l.options.fileLoader != nil {
@@ -494,11 +527,11 @@ func (l *trafficLimiter) load(ctx context.Context) (values map[string]limitValue
 				l.logger.Warnf("file loader: %v", er)
 			}
 			for _, s := range list {
-				key, in, out := l.parseLimit(l.parseLine(s))
+				key, in, out, burst := l.parseLimit(l.parseLine(s))
 				if key == "" {
 					continue
 				}
-				values[key] = limitValue{in: in, out: out}
+				values[key] = limitValue{in: in, out: out, burst: burst}
 			}
 		} else {
 			r, er := l.options.fileLoader.Load(ctx)
@@ -507,11 +540,11 @@ func (l *trafficLimiter) load(ctx context.Context) (values map[string]limitValue
 			}
 			patterns, _ := l.parsePatterns(r)
 			for _, s := range patterns {
-				key, in, out := l.parseLimit(l.parseLine(s))
+				key, in, out, burst := l.parseLimit(l.parseLine(s))
 				if key == "" {
 					continue
 				}
-				values[key] = limitValue{in: in, out: out}
+				values[key] = limitValue{in: in, out: out, burst: burst}
 			}
 		}
 	}
@@ -522,11 +555,11 @@ func (l *trafficLimiter) load(ctx context.Context) (values map[string]limitValue
 				l.logger.Warnf("redis loader: %v", er)
 			}
 			for _, s := range list {
-				key, in, out := l.parseLimit(l.parseLine(s))
+				key, in, out, burst := l.parseLimit(l.parseLine(s))
 				if key == "" {
 					continue
 				}
-				values[key] = limitValue{in: in, out: out}
+				values[key] = limitValue{in: in, out: out, burst: burst}
 			}
 		} else {
 			r, er := l.options.redisLoader.Load(ctx)
@@ -535,11 +568,11 @@ func (l *trafficLimiter) load(ctx context.Context) (values map[string]limitValue
 			}
 			patterns, _ := l.parsePatterns(r)
 			for _, s := range patterns {
-				key, in, out := l.parseLimit(l.parseLine(s))
+				key, in, out, burst := l.parseLimit(l.parseLine(s))
 				if key == "" {
 					continue
 				}
-				values[key] = limitValue{in: in, out: out}
+				values[key] = limitValue{in: in, out: out, burst: burst}
 			}
 		}
 	}
@@ -550,11 +583,11 @@ func (l *trafficLimiter) load(ctx context.Context) (values map[string]limitValue
 		}
 		patterns, _ := l.parsePatterns(r)
 		for _, s := range patterns {
-			key, in, out := l.parseLimit(l.parseLine(s))
+			key, in, out, burst := l.parseLimit(l.parseLine(s))
 			if key == "" {
 				continue
 			}
-			values[key] = limitValue{in: in, out: out}
+			values[key] = limitValue{in: in, out: out, burst: burst}
 		}
 	}
 
@@ -585,7 +618,7 @@ func (l *trafficLimiter) parseLine(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func (l *trafficLimiter) parseLimit(s string) (key string, in, out int) {
+func (l *trafficLimiter) parseLimit(s string) (key string, in, out, burst int) {
 	s = strings.Replace(s, "\t", " ", -1)
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -611,6 +644,11 @@ func (l *trafficLimiter) parseLimit(s string) (key string, in, out int) {
 			out = int(v)
 		}
 	}
+	if len(ss) > 3 {
+		if v, _ := units.ParseBase2Bytes(ss[3]); v > 0 {
+			burst = int(v)
+		}
+	}
 
 	return
 }
@@ -622,6 +660,9 @@ func (l *trafficLimiter) Close() error {
 	}
 	if l.options.redisLoader != nil {
 		l.options.redisLoader.Close()
+	}
+	if l.options.httpLoader != nil {
+		l.options.httpLoader.Close()
 	}
 	return nil
 }

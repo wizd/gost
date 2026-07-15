@@ -8,7 +8,17 @@ import (
 	"strings"
 )
 
-func ParseInterfaceAddr(ifceName, network string) (ifce string, addr []net.Addr, err error) {
+// ParseInterfaceAddr resolves ifceName to a network interface name and its addresses.
+// If ifceName is an IP address, it finds the corresponding interface and returns
+// a single address with port 0. If ifceName is an interface name, it returns all
+// addresses assigned to that interface. The network parameter determines the address
+// type (TCPAddr for "tcp"/"tcp4"/"tcp6", UDPAddr for "udp"/"udp4"/"udp6", IPAddr
+// otherwise).
+//
+// isIP reports whether ifceName was parsed as an IP address (true) rather than an
+// interface name (false). When isIP is true, callers should skip SO_BINDTODEVICE —
+// the user's intent is source IP binding for policy routing, not device binding.
+func ParseInterfaceAddr(ifceName, network string) (ifce string, addr []net.Addr, isIP bool, err error) {
 	if ifceName == "" {
 		addr = append(addr, nil)
 		return
@@ -37,6 +47,8 @@ func ParseInterfaceAddr(ifceName, network string) (ifce string, addr []net.Addr,
 			}
 		}
 	} else {
+		// ifceName is an IP address — skip SO_BINDTODEVICE, use LocalAddr only
+		isIP = true
 		ifce, err = findInterfaceByIP(ip)
 		if err != nil {
 			return
@@ -90,6 +102,7 @@ func findInterfaceByIP(ip net.IP) (string, error) {
 // e.g. 192.168.1.1:0-65535
 type AddrPortRange string
 
+// Addrs expands the port range into individual "host:port" strings.
 func (p AddrPortRange) Addrs() (addrs []string) {
 	// ignore url scheme, e.g. http://, tls://, tcp://.
 	if strings.Contains(string(p), "://") {
@@ -151,15 +164,18 @@ func (pr *PortRange) Parse(s string) error {
 	}
 }
 
+// Contains reports whether port falls within the range.
 func (pr *PortRange) Contains(port int) bool {
 	return port >= pr.Min && port <= pr.Max
 }
 
+// IPRange represents a range of IP addresses.
 type IPRange struct {
 	Min netip.Addr
 	Max netip.Addr
 }
 
+// Parse parses s as a single IP or IP range "min-max" into r.
 func (r *IPRange) Parse(s string) error {
 	minmax := strings.Split(s, "-")
 	switch len(minmax) {
@@ -190,6 +206,7 @@ func (r *IPRange) Parse(s string) error {
 	}
 }
 
+// Contains reports whether addr falls within the IP range.
 func (r *IPRange) Contains(addr netip.Addr) bool {
 	return !(addr.Less(r.Min) || r.Max.Less(addr))
 }

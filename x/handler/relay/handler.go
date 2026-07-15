@@ -13,7 +13,6 @@ import (
 	"github.com/go-gost/core/limiter"
 	"github.com/go-gost/core/limiter/traffic"
 	md "github.com/go-gost/core/metadata"
-	"github.com/go-gost/core/observer"
 	"github.com/go-gost/core/observer/stats"
 	"github.com/go-gost/core/recorder"
 	"github.com/go-gost/relay"
@@ -38,6 +37,42 @@ func init() {
 	registry.HandlerRegistry().Register("relay", NewHandler)
 }
 
+// relayHandler is the GOST relay protocol server handler.
+//
+// The GOST relay protocol is a custom multiplexed transport supporting three modes:
+//  1. Connect — the client requests a connection to a target address.
+//     The handler dials via the configured Router and pipes data bidirectionally.
+//     - Direct: handleConnect(), target address from the relay request.
+//     - Forward: handleForward(), target from hop selector (load balancing).
+//  2. Bind — the client asks the handler to listen on a local port and forward
+//     incoming connections back through a mux session. Used for reverse proxying.
+//  3. Forward — when a hop is set, the target is selected by the hop's strategy
+//     rather than specified by the client.
+//
+// Data flow:
+//
+//	┌─────────────────────────────────────────────────────────┐
+//	│ Handle() → parse relay.Request                          │
+//	│   ├─ extract auth (UserAuthFeature) → authenticate      │
+//	│   ├─ extract target address (AddrFeature)                │
+//	│   └─ extract network type (NetworkFeature)               │
+//	│                                                          │
+//	│ ┌── hop set? ──→ handleForward()                         │
+//	│ │   ├─ hop.Select() pick target node                     │
+//	│ │   └─ Router.Dial() → Pipe bidir copy                   │
+//	│                                                          │
+//	│ └── no hop, dispatch by command:                         │
+//	│   ├─ CmdConnect → handleConnect()                        │
+//	│   │   ├─ bypass check                                    │
+//	│   │   ├─ consistent-hashing                              │
+//	│   │   ├─ Router.Dial() / net.Dial() / serial.Open        │
+//	│   │   ├─ send response header (noDelay)                  │
+//	│   │   ├─ optional protocol sniffing (HTTP/TLS MITM)      │
+//	│   │   └─ Pipe bidir data copy                            │
+//	│   └─ CmdBind → handleBind()                              │
+//	│       ├─ bindTCP: net.Listen → mux session → tcpHandler │
+//	│       └─ bindUDP: net.ListenPacket → udp.Relay           │
+//	└─────────────────────────────────────────────────────────┘
 type relayHandler struct {
 	hop      hop.Hop
 	md       metadata
@@ -60,6 +95,14 @@ func NewHandler(opts ...handler.Option) handler.Handler {
 	}
 }
 
+// Init initialises the relay handler. Called after the handler is registered with a service.
+//
+// Initialisation flow:
+//  1. Parse metadata config (timeouts, sniffing, mux, MITM, etc.)
+//  2. If an Observer is configured, create a stats counter and start the background polling goroutine.
+//  3. If a TrafficLimiter is configured, create a cached traffic limiter.
+//  4. Pick the ServiceHandler recorder from the recorder list.
+//  5. If MITM certificates are configured, create an in-memory cert pool.
 func (h *relayHandler) Init(md md.Metadata) (err error) {
 	if err := h.parseMetadata(md); err != nil {
 		return err
@@ -100,6 +143,22 @@ func (h *relayHandler) Forward(hop hop.Hop) {
 	h.hop = hop
 }
 
+// Handle is the main entry point for each inbound connection.
+//
+// Flow:
+//  1. Create a recorder object with connection metadata.
+//  2. Wrap the connection for stats collection (input/output bytes).
+//  3. Rate-limit check.
+//  4. Set read deadline, read the relay.Request.
+//  5. Clear the read deadline.
+//  6. Check the relay protocol version.
+//  7. Parse request features (auth, address, network type).
+//  8. Authenticate (if an Auther is configured).
+//  9. Dispatch:
+//     - If hop is set → handleForward.
+//     - CmdConnect → handleConnect.
+//     - CmdBind → handleBind.
+//  10. Deferred final stats recording.
 func (h *relayHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.HandleOption) (err error) {
 	defer conn.Close()
 
@@ -177,6 +236,7 @@ func (h *relayHandler) Handle(ctx context.Context, conn net.Conn, opts ...handle
 
 	var user, pass string
 	var address string
+	var addrFeature *relay.AddrFeature
 	var networkID relay.NetworkID
 	for _, f := range req.Features {
 		switch f.Type() {
@@ -186,7 +246,7 @@ func (h *relayHandler) Handle(ctx context.Context, conn net.Conn, opts ...handle
 			}
 		case relay.FeatureAddr:
 			if feature, _ := f.(*relay.AddrFeature); feature != nil {
-				address = net.JoinHostPort(feature.Host, strconv.Itoa(int(feature.Port)))
+				addrFeature = feature
 			}
 		case relay.FeatureNetwork:
 			if feature, _ := f.(*relay.NetworkFeature); feature != nil {
@@ -216,12 +276,20 @@ func (h *relayHandler) Handle(ctx context.Context, conn net.Conn, opts ...handle
 	if (req.Cmd & relay.FUDP) == relay.FUDP {
 		network = "udp"
 	}
+	if addrFeature != nil {
+		switch network {
+		case "unix", "serial":
+			address = addrFeature.Host
+		default:
+			address = net.JoinHostPort(addrFeature.Host, strconv.Itoa(int(addrFeature.Port)))
+		}
+	}
 	ro.Network = network
 	ro.Host = address
 	log = log.WithFields(map[string]any{"network": network})
 
 	if h.hop != nil {
-		// forward mode
+		// Forward mode: target is selected from the hop.
 		return h.handleForward(ctx, conn, network, ro, log)
 	}
 
@@ -243,47 +311,4 @@ func (h *relayHandler) Close() error {
 		h.cancel()
 	}
 	return nil
-}
-
-func (h *relayHandler) checkRateLimit(addr net.Addr) bool {
-	if h.options.RateLimiter == nil {
-		return true
-	}
-	host, _, _ := net.SplitHostPort(addr.String())
-	if limiter := h.options.RateLimiter.Limiter(host); limiter != nil {
-		return limiter.Allow(1)
-	}
-
-	return true
-}
-
-func (h *relayHandler) observeStats(ctx context.Context) {
-	if h.options.Observer == nil {
-		return
-	}
-
-	var events []observer.Event
-
-	ticker := time.NewTicker(h.md.observerPeriod)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if len(events) > 0 {
-				if err := h.options.Observer.Observe(ctx, events); err == nil {
-					events = nil
-				}
-				break
-			}
-
-			evs := h.stats.Events()
-			if err := h.options.Observer.Observe(ctx, evs); err != nil {
-				events = evs
-			}
-
-		case <-ctx.Done():
-			return
-		}
-	}
 }

@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-gost/core/logger"
 	xlogger "github.com/go-gost/x/logger"
@@ -28,7 +30,7 @@ func (l *stringList) Set(value string) error {
 }
 
 var (
-	cfgFile      string
+	cfgFiles     stringList
 	outputFormat string
 	services     stringList
 	nodes        stringList
@@ -36,6 +38,7 @@ var (
 	trace        bool
 	apiAddr      string
 	metricsAddr  string
+	reload       time.Duration
 )
 
 func init() {
@@ -46,39 +49,43 @@ func init() {
 	if strings.Contains(args, " -- ") {
 		var (
 			wg  sync.WaitGroup
-			ret int
+			ret atomic.Int32
 		)
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		wargsList := strings.Split(" "+args+" ", " -- ")
 
-		for wid, wargs := range strings.Split(" "+args+" ", " -- ") {
-			wg.Add(1)
-			go func(wid int, wargs string) {
-				defer wg.Done()
-				defer cancel()
-				worker(wid, strings.Split(wargs, "  "), &ctx, &ret)
-			}(wid, strings.TrimSpace(wargs))
+		ctx, cancel := context.WithCancel(context.Background())
+
+		for wid, wargs := range wargsList {
+			wg.Go(func() {
+				worker(wid, strings.Split(strings.TrimSpace(wargs), "  "), ctx, &ret)
+			})
 		}
 
 		wg.Wait()
+		cancel()
 
-		os.Exit(ret)
+		os.Exit(int(ret.Load()))
 	}
 }
 
-func worker(id int, args []string, ctx *context.Context, ret *int) {
-	cmd := exec.CommandContext(*ctx, os.Args[0], args...)
+func worker(id int, args []string, ctx context.Context, ret *atomic.Int32) {
+	cmd := exec.CommandContext(ctx, os.Args[0], args...)
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), fmt.Sprintf("_GOST_ID=%d", id))
 
 	if err := cmd.Run(); err != nil {
-		log.Fatal(err)
+		// Context cancellation is expected when one worker exits early.
+		// Only log fatal on other errors.
+		if ctx.Err() == nil {
+			log.Fatal(err)
+		}
+		return
 	}
-	if cmd.ProcessState.Exited() {
-		*ret = cmd.ProcessState.ExitCode()
+	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+		ret.Store(int32(cmd.ProcessState.ExitCode()))
 	}
 }
 
@@ -87,13 +94,14 @@ func init() {
 
 	flag.Var(&services, "L", "service list")
 	flag.Var(&nodes, "F", "chain node list")
-	flag.StringVar(&cfgFile, "C", "", "configuration file")
+	flag.Var(&cfgFiles, "C", "config file(s), URL(s), or inline JSON")
 	flag.BoolVar(&printVersion, "V", false, "print version")
 	flag.StringVar(&outputFormat, "O", "", "output format, one of yaml|json format")
 	flag.BoolVar(&debug, "D", false, "debug mode")
 	flag.BoolVar(&trace, "DD", false, "trace mode")
 	flag.StringVar(&apiAddr, "api", "", "api service address")
 	flag.StringVar(&metricsAddr, "metrics", "", "metrics service address")
+	flag.DurationVar(&reload, "R", 0, "auto reload period (e.g. 30s, 1m)")
 	flag.Parse()
 
 	if printVersion {
