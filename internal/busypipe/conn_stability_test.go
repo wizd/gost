@@ -406,3 +406,151 @@ func TestKeepalivePADNotStarvedByWrite(t *testing.T) {
 		t.Fatalf("client write errored: %v", err)
 	}
 }
+
+func TestDefaultIdleTimeoutRaised(t *testing.T) {
+	if DefaultIdleTimeoutMS < 120000 {
+		t.Fatalf("DefaultIdleTimeoutMS=%d, want >= 120000", DefaultIdleTimeoutMS)
+	}
+	cfg := DefaultConfig()
+	if cfg.IdleTimeoutMS != DefaultIdleTimeoutMS {
+		t.Fatalf("DefaultConfig IdleTimeoutMS=%d, want %d", cfg.IdleTimeoutMS, DefaultIdleTimeoutMS)
+	}
+}
+
+// TestSetWriteDeadlineDoesNotKillKeepalive 验证应用层写 deadline 不会穿透污染
+// keepalive PAD：一端设置极短 WriteDeadline 后清零，对端仍能靠 PAD 保活。
+func TestSetWriteDeadlineDoesNotKillKeepalive(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.TickMS = 50
+	cfg.IdleTimeoutMS = 1500
+	cfg.WarmupMS = 0
+	cfg.MinBPS = 8000
+	cfg.ReadBufferBytes = 64 * 1024
+
+	client, server, cleanup := dialPair(t, cfg)
+	defer cleanup()
+
+	// 故意设置一个已过期的写 deadline，再清零——若穿透到 raw 且未恢复，后续 PAD 会失败。
+	_ = client.SetWriteDeadline(time.Now().Add(-time.Second))
+	_ = client.SetWriteDeadline(time.Time{})
+
+	// 仅让 server 消费，client 不写业务数据，依赖 keepalive PAD 刷新 server.lastRecv。
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := server.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	time.Sleep(4 * time.Second)
+
+	// client 仍应可写；若 keepalive 被 deadline 误杀，连接已关闭。
+	_ = client.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client.Write([]byte("still-alive")); err != nil {
+		t.Fatalf("client write after keepalive window failed: %v", err)
+	}
+}
+
+// TestCloseWriteHalfClose 验证 CloseWrite 后本端不能再写，但对端仍可读完已在途数据，
+// 且本端 Read 在对端继续写时仍可用。
+func TestCloseWriteHalfClose(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.TickMS = 50
+	cfg.IdleTimeoutMS = 5000
+	cfg.WarmupMS = 0
+	cfg.ReadBufferBytes = 64 * 1024
+
+	client, server, cleanup := dialPair(t, cfg)
+	defer cleanup()
+
+	payload := []byte("before-close-write")
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+
+	if _, err := client.Write([]byte("should-fail")); err == nil {
+		t.Fatal("Write after CloseWrite should fail")
+	}
+
+	buf := make([]byte, 64)
+	n, err := server.Read(buf)
+	if err != nil {
+		t.Fatalf("server Read: %v", err)
+	}
+	if string(buf[:n]) != string(payload) {
+		t.Fatalf("server got %q, want %q", buf[:n], payload)
+	}
+
+	// 对端仍可写，本端仍可读。
+	reply := []byte("from-server")
+	if _, err := server.Write(reply); err != nil {
+		t.Fatalf("server Write after peer CloseWrite: %v", err)
+	}
+	n, err = client.Read(buf)
+	if err != nil {
+		t.Fatalf("client Read after CloseWrite: %v", err)
+	}
+	if string(buf[:n]) != string(reply) {
+		t.Fatalf("client got %q, want %q", buf[:n], reply)
+	}
+}
+
+// TestLivenessPADWhenDeficitZero 高吞吐（Deficit==0）时仍应有 liveness PAD，
+// 使只有反向空闲的一端不因 idle 误断。
+func TestLivenessPADWhenDeficitZero(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.TickMS = 50
+	cfg.IdleTimeoutMS = 800
+	cfg.WarmupMS = 0
+	cfg.MinBPS = 8000
+	cfg.ReadBufferBytes = 256 * 1024
+
+	client, server, cleanup := dialPair(t, cfg)
+	defer cleanup()
+
+	stop := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		// 远超 min_bps，确保 Deficit 长期为 0。
+		buf := make([]byte, 8192)
+		for {
+			select {
+			case <-stop:
+				writerDone <- nil
+				return
+			default:
+			}
+			if _, err := client.Write(buf); err != nil {
+				writerDone <- err
+				return
+			}
+		}
+	}()
+
+	readerDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16384)
+		for {
+			if _, err := server.Read(buf); err != nil {
+				readerDone <- err
+				return
+			}
+		}
+	}()
+
+	select {
+	case err := <-writerDone:
+		t.Fatalf("writer exited unexpectedly: %v", err)
+	case err := <-readerDone:
+		t.Fatalf("reader exited unexpectedly: %v", err)
+	case <-time.After(2500 * time.Millisecond):
+	}
+	close(stop)
+	_ = client.Close()
+}

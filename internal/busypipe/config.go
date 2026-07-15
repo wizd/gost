@@ -16,7 +16,9 @@ const (
 	DefaultMinBPS        = 8000
 	DefaultTickMS        = 250
 	DefaultMaxFrameSize  = 1400
-	DefaultIdleTimeoutMS = 15000
+	// DefaultIdleTimeoutMS 默认 120s。原 15s 在单向大流量 / TCP 写阻塞时
+	// 容易误触发 idle timeout（见 BUSYPIPE.md 与部署文档 §10）。
+	DefaultIdleTimeoutMS = 120000
 	DefaultMinJitter     = 8
 	DefaultWarmupMS      = 3000
 	// DefaultReadBufferBytes 默认 256 KB；超过该上限时 readLoop 阻塞，
